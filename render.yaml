@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: cammy-vapi-tool-server
+    runtime: node
+    plan: starter
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: ONEDRIVE_ROUTER
+        value: https://eoc09ly9stpskyz.m.pipedream.net
+      - key: READ_ENDPOINT
+        value: https://eo54pqk9broiael.m.pipedream.net
+      - key: BRAIN_ITEM_ID
+        value: FD682E54F97FD13C!sfe87fab543a74c35a325354af330643e
+      - key: PIPEDREAM_GCAL_URL
+        value: REPLACE_WITH_PIPEDREAM_GCAL_URL
