@@ -1,0 +1,16 @@
+{
+  "name": "cammy-vapi-tool-server",
+  "version": "1.0.0",
+  "description": "Cammy AI EA - Vapi real-time tool call server",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
