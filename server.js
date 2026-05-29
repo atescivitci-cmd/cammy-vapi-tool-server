@@ -1,16 +1,16 @@
 // ============================================================
-// Cammy Vapi Tool Server v1.1
+// Cammy Vapi Tool Server v1.2
 // Handles 4 real-time tool calls from Vapi during voice calls:
 //   POST /vapi/get_today_schedule
 //   POST /vapi/get_urgent_emails
 //   POST /vapi/get_open_loops
 //   POST /vapi/get_brain_fact
 //
-// Auth strategy:
-//   - Google Calendar / Gmail: GCAL_TOKEN env var (refreshed by Cammy cron)
-//   - OneDrive reads: via search_files_v2 pattern through Pipedream
-//     The server POSTs to the Perplexity tool proxy for file reads
-//     (no direct Graph credentials needed)
+// Auth strategy (v1.2 - no expiring tokens):
+//   - Google Calendar / Gmail: proxied through PIPEDREAM_GCAL_URL
+//     (a Pipedream HTTP endpoint that holds the permanent Google OAuth
+//     connected account - never expires, no token refresh needed)
+//   - OneDrive reads: via READ_ENDPOINT (existing Pipedream workflow)
 // ============================================================
 
 import express from "express";
@@ -23,13 +23,15 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 
 // ── Env vars ─────────────────────────────────────────────────
-const GCAL_TOKEN        = process.env.GCAL_TOKEN;        // Google OAuth access token
-const ONEDRIVE_ROUTER   = process.env.ONEDRIVE_ROUTER || "https://eoc09ly9stpskyz.m.pipedream.net";
-const READ_ENDPOINT     = process.env.READ_ENDPOINT   || "https://eo54pqk9broiael.m.pipedream.net";
-const BRAIN_ITEM_ID     = process.env.BRAIN_ITEM_ID   || "FD682E54F97FD13C!sfe87fab543a74c35a325354af330643e";
+// PIPEDREAM_GCAL_URL: Pipedream endpoint that proxies Google Calendar/Gmail
+// Format: https://eoxxx.m.pipedream.net  (deployed separately - see README)
+const PIPEDREAM_GCAL_URL  = process.env.PIPEDREAM_GCAL_URL;
+const ONEDRIVE_ROUTER     = process.env.ONEDRIVE_ROUTER  || "https://eoc09ly9stpskyz.m.pipedream.net";
+const READ_ENDPOINT       = process.env.READ_ENDPOINT    || "https://eo54pqk9broiael.m.pipedream.net";
+const BRAIN_ITEM_ID       = process.env.BRAIN_ITEM_ID    || "FD682E54F97FD13C!sfe87fab543a74c35a325354af330643e";
 
 // ── Helper: HTTP/S GET with timeout ─────────────────────────
-function get(url, headers = {}, timeoutMs = 8000) {
+function get(url, headers = {}, timeoutMs = 9000) {
   return new Promise((resolve, reject) => {
     const mod = url.startsWith("https") ? https : http;
     const req = mod.get(url, { headers, timeout: timeoutMs }, (res) => {
@@ -46,7 +48,7 @@ function get(url, headers = {}, timeoutMs = 8000) {
 }
 
 // ── Helper: POST JSON ────────────────────────────────────────
-function post(url, payload, headers = {}, timeoutMs = 8000) {
+function post(url, payload, headers = {}, timeoutMs = 9000) {
   return new Promise((resolve, reject) => {
     const body = JSON.stringify(payload);
     const urlObj = new URL(url);
@@ -75,20 +77,28 @@ function post(url, payload, headers = {}, timeoutMs = 8000) {
 
 // ── Helper: ET formatting ─────────────────────────────────────
 function todayISOET() {
-  return new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" }); // YYYY-MM-DD
+  return new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
 }
 
 function nowET() {
   return new Date().toLocaleString("en-US", { timeZone: "America/New_York" });
 }
 
-// ── Helper: read OneDrive file via read endpoint ──────────────
+// ── Helper: proxy call to Pipedream Google endpoint ──────────
+// Pipedream workflow receives { action, params } and returns { result }
+async function callGcalProxy(action, params = {}) {
+  if (!PIPEDREAM_GCAL_URL) throw new Error("PIPEDREAM_GCAL_URL not set");
+  const resp = await post(PIPEDREAM_GCAL_URL, { action, params });
+  if (resp.body?.error) throw new Error(resp.body.error);
+  return resp.body;
+}
+
+// ── Helper: brain cache (5 min TTL) ──────────────────────────
 let brainCache = null;
 let brainCacheAt = 0;
 
 async function readBrain() {
   if (brainCache && Date.now() - brainCacheAt < 5 * 60 * 1000) return brainCache;
-  // Try read endpoint with item_id
   const resp = await get(`${READ_ENDPOINT}?item_id=${encodeURIComponent(BRAIN_ITEM_ID)}`);
   if (resp.body?.download_url) {
     const dl = await get(resp.body.download_url);
@@ -96,15 +106,7 @@ async function readBrain() {
     brainCacheAt = Date.now();
     return brainCache;
   }
-  // Fallback: try router read action
-  const resp2 = await post(ONEDRIVE_ROUTER, { action: "read", item_id: BRAIN_ITEM_ID });
-  if (resp2.body?.download_url) {
-    const dl2 = await get(resp2.body.download_url);
-    brainCache = typeof dl2.body === "string" ? JSON.parse(dl2.body) : dl2.body;
-    brainCacheAt = Date.now();
-    return brainCache;
-  }
-  throw new Error("Could not read brain.json");
+  throw new Error("Could not read brain.json from read endpoint");
 }
 
 // ── Helper: extract Vapi tool call args ──────────────────────
@@ -131,15 +133,10 @@ function vapiRespond(res, text, toolCallId) {
 app.post("/vapi/get_today_schedule", async (req, res) => {
   const { toolCallId } = extractArgs(req.body);
   try {
-    if (!GCAL_TOKEN) return vapiRespond(res, "Calendar access not configured.", toolCallId);
-
     const today = todayISOET();
-    const startOfDay = `${today}T00:00:00-04:00`;
-    const endOfDay   = `${today}T23:59:59-04:00`;
-    const url = `https://www.googleapis.com/calendar/v3/calendars/primary/events?timeMin=${encodeURIComponent(startOfDay)}&timeMax=${encodeURIComponent(endOfDay)}&singleEvents=true&orderBy=startTime&maxResults=20`;
+    const data = await callGcalProxy("get_today_schedule", { date: today });
 
-    const resp = await get(url, { Authorization: `Bearer ${GCAL_TOKEN}` });
-    const events = resp.body?.items || [];
+    const events = data?.events || [];
     const now = new Date();
 
     const remaining = events.filter(e => {
@@ -169,50 +166,12 @@ app.post("/vapi/get_today_schedule", async (req, res) => {
 app.post("/vapi/get_urgent_emails", async (req, res) => {
   const { toolCallId } = extractArgs(req.body);
   try {
-    if (!GCAL_TOKEN) return vapiRespond(res, "Email access not configured.", toolCallId);
+    const data = await callGcalProxy("get_urgent_emails", {});
 
-    const T1 = ["beth", "izzy", "leo", "atil", "mehmet", "pat", "jack", "scott", "arun", "greg", "tugce", "efruz", "duncan"];
-    const T3 = ["hannah", "marko iskander", "alex kokolis", "alex peters", "tanniss", "lex van", "johann eid"];
-    const RECRUITER = ["opportunity", "role", "vp", "cro", "chief", "joining", "position", "executive"];
-    const SKIP = ["osttra", "ion group", "trireduce", "traiana"];
-
-    const yesterday = new Date(Date.now() - 24 * 3600 * 1000).toISOString().split("T")[0];
-    const q = encodeURIComponent(`is:unread after:${yesterday}T00:00:00-04:00`);
-    const listResp = await get(
-      `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${q}&maxResults=20`,
-      { Authorization: `Bearer ${GCAL_TOKEN}` }
-    );
-
-    const messages = listResp.body?.messages || [];
-    if (!messages.length) return vapiRespond(res, "No unread emails in the last 24 hours.", toolCallId);
-
-    const hits = [];
-    for (const msg of messages.slice(0, 15)) {
-      const detail = await get(
-        `https://gmail.googleapis.com/gmail/v1/users/me/messages/${msg.id}?format=metadata&metadataHeaders=From&metadataHeaders=Subject`,
-        { Authorization: `Bearer ${GCAL_TOKEN}` }
-      );
-      const hdrs = detail.body?.payload?.headers || [];
-      const from = (hdrs.find(h => h.name === "From")?.value || "").toLowerCase();
-      const subj = (hdrs.find(h => h.name === "Subject")?.value || "");
-      const subjL = subj.toLowerCase();
-
-      if (SKIP.some(k => from.includes(k) || subjL.includes(k))) continue;
-
-      let tier = null;
-      if (T1.some(n => from.includes(n))) tier = "T1";
-      else if (T3.some(n => from.includes(n))) tier = "T3";
-      else if (RECRUITER.some(k => subjL.includes(k))) tier = "RECRUITER";
-
-      if (tier) {
-        const name = from.split("<")[0].trim().split(" ")[0] || from.split("@")[0];
-        hits.push({ name, subj, tier });
-      }
-    }
-
+    const hits = data?.hits || [];
     if (!hits.length) return vapiRespond(res, "No high-priority emails right now.", toolCallId);
 
-    const lines = hits.slice(0, 4).map(h => `From ${h.name}: ${h.subj}`).join(". ");
+    const lines = hits.slice(0, 4).map(h => `From ${h.name}: ${h.subject}`).join(". ");
     vapiRespond(res, `You have ${hits.length} priority email${hits.length > 1 ? "s" : ""}. ${lines}.`, toolCallId);
 
   } catch (err) {
@@ -288,7 +247,7 @@ app.post("/vapi/get_brain_fact", async (req, res) => {
 });
 
 // ── Health check ─────────────────────────────────────────────
-app.get("/health", (_req, res) => res.json({ ok: true, uptime: process.uptime(), time: nowET() }));
-app.get("/", (_req, res) => res.json({ ok: true, server: "cammy-vapi-tool-server", v: "1.1" }));
+app.get("/health", (_req, res) => res.json({ ok: true, uptime: process.uptime(), time: nowET(), v: "1.2" }));
+app.get("/", (_req, res) => res.json({ ok: true, server: "cammy-vapi-tool-server", v: "1.2" }));
 
-app.listen(PORT, () => console.log(`[${nowET()}] Cammy Vapi Tool Server on port ${PORT}`));
+app.listen(PORT, () => console.log(`[${nowET()}] Cammy Vapi Tool Server v1.2 on port ${PORT}`));
