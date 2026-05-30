@@ -1,16 +1,18 @@
 // ============================================================
-// Cammy Vapi Tool Server v1.2
-// Handles 4 real-time tool calls from Vapi during voice calls:
+// Cammy Vapi Tool Server v1.3
+// Handles 5 real-time tool calls from Vapi during voice calls:
 //   POST /vapi/get_today_schedule
 //   POST /vapi/get_urgent_emails
 //   POST /vapi/get_open_loops
 //   POST /vapi/get_brain_fact
+//   POST /onedrive/move   <-- NEW v1.3: moves a file via Graph API
 //
-// Auth strategy (v1.2 - no expiring tokens):
+// Auth strategy (v1.2/v1.3 - no expiring tokens):
 //   - Google Calendar / Gmail: proxied through PIPEDREAM_GCAL_URL
 //     (a Pipedream HTTP endpoint that holds the permanent Google OAuth
 //     connected account - never expires, no token refresh needed)
 //   - OneDrive reads: via READ_ENDPOINT (existing Pipedream workflow)
+//   - OneDrive moves: via ONEDRIVE_MOVE_URL (Pipedream workflow - holds Graph OAuth)
 // ============================================================
 
 import express from "express";
@@ -24,11 +26,12 @@ const PORT = process.env.PORT || 3000;
 
 // ── Env vars ─────────────────────────────────────────────────
 // PIPEDREAM_GCAL_URL: Pipedream endpoint that proxies Google Calendar/Gmail
-// Format: https://eoxxx.m.pipedream.net  (deployed separately - see README)
 const PIPEDREAM_GCAL_URL  = process.env.PIPEDREAM_GCAL_URL;
 const ONEDRIVE_ROUTER     = process.env.ONEDRIVE_ROUTER  || "https://eoc09ly9stpskyz.m.pipedream.net";
 const READ_ENDPOINT       = process.env.READ_ENDPOINT    || "https://eo54pqk9broiael.m.pipedream.net";
 const BRAIN_ITEM_ID       = process.env.BRAIN_ITEM_ID    || "FD682E54F97FD13C!sfe87fab543a74c35a325354af330643e";
+// NEW v1.3: Pipedream workflow that executes Graph API PATCH /move
+const ONEDRIVE_MOVE_URL   = process.env.ONEDRIVE_MOVE_URL || "";
 
 // ── Helper: HTTP/S GET with timeout ─────────────────────────
 function get(url, headers = {}, timeoutMs = 9000) {
@@ -246,8 +249,44 @@ app.post("/vapi/get_brain_fact", async (req, res) => {
   }
 });
 
-// ── Health check ─────────────────────────────────────────────
-app.get("/health", (_req, res) => res.json({ ok: true, uptime: process.uptime(), time: nowET(), v: "1.2" }));
-app.get("/", (_req, res) => res.json({ ok: true, server: "cammy-vapi-tool-server", v: "1.2" }));
+// ============================================================
+// TOOL 5 (NEW v1.3): /onedrive/move
+// Moves a OneDrive file to a new parent folder via Pipedream proxy
+// Body: { item_id, destination_folder_id, new_name? }
+// Returns: { success, item_id, name, webUrl } or { error }
+// ============================================================
+app.post("/onedrive/move", async (req, res) => {
+  const { item_id, destination_folder_id, new_name } = req.body || {};
 
-app.listen(PORT, () => console.log(`[${nowET()}] Cammy Vapi Tool Server v1.2 on port ${PORT}`));
+  if (!item_id || !destination_folder_id) {
+    return res.status(400).json({ error: "item_id and destination_folder_id are required" });
+  }
+
+  if (!ONEDRIVE_MOVE_URL) {
+    return res.status(503).json({ error: "ONEDRIVE_MOVE_URL env var not set" });
+  }
+
+  try {
+    const payload = { item_id, destination_folder_id };
+    if (new_name) payload.new_name = new_name;
+
+    const resp = await post(ONEDRIVE_MOVE_URL, payload, {}, 15000);
+
+    if (resp.status >= 200 && resp.status < 300) {
+      return res.json({ success: true, ...(typeof resp.body === "object" ? resp.body : { raw: resp.body }) });
+    } else {
+      const errMsg = resp.body?.error?.message || resp.body?.message || JSON.stringify(resp.body);
+      console.error("[onedrive/move] upstream error:", resp.status, errMsg);
+      return res.status(resp.status).json({ error: errMsg, upstream_status: resp.status });
+    }
+  } catch (err) {
+    console.error("[onedrive/move]", err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Health check ─────────────────────────────────────────────
+app.get("/health", (_req, res) => res.json({ ok: true, uptime: process.uptime(), time: nowET(), v: "1.3" }));
+app.get("/", (_req, res) => res.json({ ok: true, server: "cammy-vapi-tool-server", v: "1.3" }));
+
+app.listen(PORT, () => console.log(`[${nowET()}] Cammy Vapi Tool Server v1.3 on port ${PORT}`));
