@@ -1,11 +1,13 @@
 // ============================================================
-// Cammy Vapi Tool Server v1.3
-// Handles 5 real-time tool calls from Vapi during voice calls:
+// Cammy Vapi Tool Server v1.4
+// Handles tool calls from Vapi during voice calls:
 //   POST /vapi/get_today_schedule
 //   POST /vapi/get_urgent_emails
 //   POST /vapi/get_open_loops
 //   POST /vapi/get_brain_fact
-//   POST /onedrive/move   <-- NEW v1.3: moves a file via Graph API
+//   POST /onedrive/move          <-- v1.3: moves a file via Graph API
+//   POST /meeting/start          <-- NEW v1.4: activates meeting listen mode
+//   POST /meeting/end            <-- NEW v1.4: ends meeting, summarizes, saves to OneDrive
 //
 // Auth strategy (v1.2/v1.3 - no expiring tokens):
 //   - Google Calendar / Gmail: proxied through PIPEDREAM_GCAL_URL
@@ -13,6 +15,7 @@
 //     connected account - never expires, no token refresh needed)
 //   - OneDrive reads: via READ_ENDPOINT (existing Pipedream workflow)
 //   - OneDrive moves: via ONEDRIVE_MOVE_URL (Pipedream workflow - holds Graph OAuth)
+//   - OneDrive writes: via ONEDRIVE_ROUTER (Pipedream workflow)
 // ============================================================
 
 import express from "express";
@@ -32,6 +35,8 @@ const READ_ENDPOINT       = process.env.READ_ENDPOINT    || "https://eo54pqk9bro
 const BRAIN_ITEM_ID       = process.env.BRAIN_ITEM_ID    || "FD682E54F97FD13C!sfe87fab543a74c35a325354af330643e";
 // NEW v1.3: Pipedream workflow that executes Graph API PATCH /move
 const ONEDRIVE_MOVE_URL   = process.env.ONEDRIVE_MOVE_URL || "";
+// NEW v1.4: OpenAI API key for meeting summarization
+const OPENAI_API_KEY      = process.env.OPENAI_API_KEY || "";
 
 // ── Helper: HTTP/S GET with timeout ─────────────────────────
 function get(url, headers = {}, timeoutMs = 9000) {
@@ -285,8 +290,242 @@ app.post("/onedrive/move", async (req, res) => {
   }
 });
 
-// ── Health check ─────────────────────────────────────────────
-app.get("/health", (_req, res) => res.json({ ok: true, uptime: process.uptime(), time: nowET(), v: "1.3" }));
-app.get("/", (_req, res) => res.json({ ok: true, server: "cammy-vapi-tool-server", v: "1.3" }));
+// ============================================================
+// MEETING LISTEN MODE (NEW v1.4)
+// In-memory session state — one active meeting at a time
+// ============================================================
+let meetingState = {
+  active: false,
+  startTime: null,
+  title: "Untitled Meeting",
+  attendees: [],
+};
 
-app.listen(PORT, () => console.log(`[${nowET()}] Cammy Vapi Tool Server v1.3 on port ${PORT}`));
+// ── Helper: call OpenAI GPT-4o-mini ─────────────────────────
+async function callOpenAI(systemPrompt, userContent, timeoutMs = 30000) {
+  if (!OPENAI_API_KEY) throw new Error("OPENAI_API_KEY not set");
+  const resp = await post(
+    "https://api.openai.com/v1/chat/completions",
+    {
+      model: "gpt-4o-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userContent },
+      ],
+      temperature: 0.3,
+      max_tokens: 1500,
+    },
+    { Authorization: `Bearer ${OPENAI_API_KEY}` },
+    timeoutMs
+  );
+  if (resp.body?.error) throw new Error(resp.body.error.message || JSON.stringify(resp.body.error));
+  return resp.body?.choices?.[0]?.message?.content || "";
+}
+
+// ── Helper: format duration ──────────────────────────────────
+function formatDuration(startMs, endMs) {
+  const diffMs = endMs - startMs;
+  const mins = Math.round(diffMs / 60000);
+  if (mins < 60) return `${mins} minute${mins !== 1 ? "s" : ""}`;
+  const hrs = Math.floor(mins / 60);
+  const rem = mins % 60;
+  return rem > 0 ? `${hrs}h ${rem}m` : `${hrs} hour${hrs !== 1 ? "s" : ""}`;
+}
+
+// ── Helper: save markdown to OneDrive via router ─────────────
+async function saveToOneDrive(filename, markdownContent) {
+  const content_b64 = Buffer.from(markdownContent, "utf8").toString("base64");
+  const payload = {
+    filename,
+    content_b64,
+    force_folder: "01 Logs/Meeting Notes",
+    overwrite: false,
+  };
+  const resp = await post(ONEDRIVE_ROUTER, payload, {}, 20000);
+  return resp;
+}
+
+// ============================================================
+// ENDPOINT: POST /meeting/start
+// Body: { title?, attendees? }
+// Called when user says "Cammy, listen to this meeting"
+// ============================================================
+app.post("/meeting/start", async (req, res) => {
+  const { toolCallId, args } = extractArgs(req.body);
+  const title = args?.title || req.body?.title || "Untitled Meeting";
+  const attendees = args?.attendees || req.body?.attendees || [];
+
+  meetingState = {
+    active: true,
+    startTime: Date.now(),
+    title,
+    attendees: Array.isArray(attendees) ? attendees : [attendees],
+  };
+
+  const timeStr = new Date().toLocaleTimeString("en-US", { timeZone: "America/New_York", hour: "numeric", minute: "2-digit" });
+  const attendeeStr = meetingState.attendees.length > 0
+    ? ` with ${meetingState.attendees.join(", ")}`
+    : "";
+
+  const message = `Meeting listen mode activated for "${title}"${attendeeStr}. Started at ${timeStr} ET. I'll capture key points, decisions, and action items. Say "Cammy, meeting done" when you're finished.`;
+
+  console.log(`[meeting/start] ${nowET()} — title="${title}" attendees=${JSON.stringify(meetingState.attendees)}`);
+
+  if (toolCallId) {
+    return vapiRespond(res, message, toolCallId);
+  }
+  return res.json({ ok: true, message, state: meetingState });
+});
+
+// ============================================================
+// ENDPOINT: POST /meeting/end
+// Body: { title?, attendees?, notes?, action_items? }
+// Called when user says "Cammy, meeting done"
+// ============================================================
+app.post("/meeting/end", async (req, res) => {
+  const { toolCallId, args } = extractArgs(req.body);
+
+  // Accept params from either Vapi args or direct body
+  const title = args?.title || req.body?.title || meetingState.title || "Untitled Meeting";
+  const attendees = args?.attendees || req.body?.attendees || meetingState.attendees || [];
+  const notes = args?.notes || req.body?.notes || "";
+  const actionItemsRaw = args?.action_items || req.body?.action_items || [];
+
+  const endTime = Date.now();
+  const startTime = meetingState.startTime || endTime;
+  const duration = formatDuration(startTime, endTime);
+  const dateET = new Date().toLocaleDateString("en-US", {
+    timeZone: "America/New_York",
+    weekday: "long",
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+  });
+  const dateISO = todayISOET();
+  const attendeeList = Array.isArray(attendees) ? attendees : [attendees];
+
+  // Reset state
+  meetingState = { active: false, startTime: null, title: "Untitled Meeting", attendees: [] };
+
+  let markdownSummary = "";
+  let spokenSummary = "";
+  let saveStatus = "not attempted";
+
+  try {
+    // ── Build GPT-4o-mini prompt ──────────────────────────────
+    const systemPrompt = `You are an executive assistant AI. Given raw meeting notes, produce a structured meeting summary in Markdown format.
+
+Output ONLY the following Markdown structure (no preamble, no explanation):
+
+## Key Points
+- [bullet points of main topics discussed]
+
+## Decisions Made
+- [bullet points of decisions reached, or "None recorded" if none]
+
+## Action Items
+- [ ] [action item] — Owner: [person or "TBD"] — Due: [date or "TBD"]
+
+## Commitments Flagged
+- [any explicit commitments, promises, or deliverables mentioned, or "None recorded" if none]
+
+Be concise but complete. Extract real commitments from names mentioned in notes.`;
+
+    const userContent = `Meeting: ${title}
+Date: ${dateET} ET
+Attendees: ${attendeeList.join(", ") || "Not specified"}
+Duration: ${duration}
+${actionItemsRaw.length > 0 ? `\nAction items captured during meeting:\n${actionItemsRaw.map(a => `- ${a}`).join("\n")}` : ""}
+
+Raw notes / transcript:
+${notes || "(No notes provided)"}`;
+
+    const gptOutput = await callOpenAI(systemPrompt, userContent);
+
+    // ── Assemble full markdown file ───────────────────────────
+    markdownSummary = `# Meeting Notes: ${title}
+Date: ${dateET} ET
+Attendees: ${attendeeList.join(", ") || "Not specified"}
+Duration: ${duration}
+
+${gptOutput}
+`;
+
+    // ── Save to OneDrive ──────────────────────────────────────
+    const safeTitle = title.replace(/[^a-zA-Z0-9\s_-]/g, "").replace(/\s+/g, "_").slice(0, 50);
+    const filename = `${dateISO}_${safeTitle}.md`;
+
+    try {
+      const saveResp = await saveToOneDrive(filename, markdownSummary);
+      saveStatus = saveResp.status >= 200 && saveResp.status < 300
+        ? `saved as ${filename}`
+        : `save failed (${saveResp.status})`;
+      console.log(`[meeting/end] OneDrive save: ${saveStatus}`);
+    } catch (saveErr) {
+      saveStatus = `save error: ${saveErr.message}`;
+      console.error("[meeting/end] OneDrive save error:", saveErr.message);
+    }
+
+    // ── Build spoken summary (short, for Vapi TTS) ───────────
+    // Extract action items from GPT output for spoken summary
+    const actionLines = (gptOutput.match(/- \[ \] .+/g) || []).slice(0, 3);
+    const actionSpoken = actionLines.length > 0
+      ? ` Action items: ${actionLines.map(l => l.replace(/- \[ \] /, "").replace(/ — Owner:.+/, "")).join("; ")}.`
+      : "";
+
+    spokenSummary = `Meeting "${title}" wrapped up. Duration was ${duration}.${actionSpoken} Full notes saved to OneDrive under Meeting Notes.`;
+
+  } catch (err) {
+    console.error("[meeting/end] GPT error:", err.message);
+    // Fallback summary without GPT
+    markdownSummary = `# Meeting Notes: ${title}
+Date: ${dateET} ET
+Attendees: ${attendeeList.join(", ") || "Not specified"}
+Duration: ${duration}
+
+## Key Points
+${notes ? notes.split(/[.!?]/).filter(s => s.trim()).slice(0, 5).map(s => `- ${s.trim()}`).join("\n") : "- (No notes captured)"}
+
+## Decisions Made
+- (Review notes manually)
+
+## Action Items
+${actionItemsRaw.length > 0 ? actionItemsRaw.map(a => `- [ ] ${a} — Owner: TBD — Due: TBD`).join("\n") : "- (None recorded)"}
+
+## Commitments Flagged
+- (Review notes manually — GPT summarization unavailable)
+`;
+    spokenSummary = `Meeting "${title}" ended after ${duration}. I saved a basic summary to OneDrive — GPT summarization was unavailable.`;
+
+    // Still try to save fallback
+    try {
+      const safeTitle = title.replace(/[^a-zA-Z0-9\s_-]/g, "").replace(/\s+/g, "_").slice(0, 50);
+      const filename = `${dateISO}_${safeTitle}.md`;
+      const saveResp = await saveToOneDrive(filename, markdownSummary);
+      saveStatus = saveResp.status >= 200 && saveResp.status < 300
+        ? `saved as ${filename} (fallback)`
+        : `save failed (${saveResp.status})`;
+    } catch (saveErr) {
+      saveStatus = `save error: ${saveErr.message}`;
+    }
+  }
+
+  console.log(`[meeting/end] ${nowET()} — title="${title}" duration=${duration} save=${saveStatus}`);
+
+  if (toolCallId) {
+    return vapiRespond(res, spokenSummary, toolCallId);
+  }
+  return res.json({
+    ok: true,
+    spoken_summary: spokenSummary,
+    save_status: saveStatus,
+    duration,
+    markdown_preview: markdownSummary.slice(0, 500),
+  });
+});
+
+// ── Health check ─────────────────────────────────────────────
+app.get("/health", (_req, res) => res.json({ ok: true, uptime: process.uptime(), time: nowET(), v: "1.4", meeting_active: meetingState.active }));
+app.get("/", (_req, res) => res.json({ ok: true, server: "cammy-vapi-tool-server", v: "1.4" }));
+
+app.listen(PORT, () => console.log(`[${nowET()}] Cammy Vapi Tool Server v1.4 on port ${PORT}`));
