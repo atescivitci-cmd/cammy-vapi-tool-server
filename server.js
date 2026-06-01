@@ -1,5 +1,5 @@
 // ============================================================
-// Cammy Vapi Tool Server v1.4
+// Cammy Vapi Tool Server v1.5
 // Handles tool calls from Vapi during voice calls:
 //   POST /vapi/get_today_schedule
 //   POST /vapi/get_urgent_emails
@@ -37,6 +37,11 @@ const BRAIN_ITEM_ID       = process.env.BRAIN_ITEM_ID    || "FD682E54F97FD13C!sf
 const ONEDRIVE_MOVE_URL   = process.env.ONEDRIVE_MOVE_URL || "";
 // NEW v1.4: OpenAI API key for meeting summarization
 const OPENAI_API_KEY      = process.env.OPENAI_API_KEY || "";
+// NEW v1.5: Perplexity Computer memory write endpoint (via Pipedream)
+const MEMORY_WRITE_URL    = process.env.MEMORY_WRITE_URL || "";
+// NEW v1.5: Decision log Excel IDs (hardcoded, same as cron_health)
+const EXCEL_FOLDER_ID     = process.env.EXCEL_FOLDER_ID  || "FD682E54F97FD13C!s62a081ff9a5d4410a8f5ef6501495ceb";
+const EXCEL_SHEET_ID      = process.env.EXCEL_SHEET_ID   || "FD682E54F97FD13C!s18f54a8c250740e7acaf944a2153706c";
 
 // ── Helper: HTTP/S GET with timeout ─────────────────────────
 function get(url, headers = {}, timeoutMs = 9000) {
@@ -524,8 +529,222 @@ ${actionItemsRaw.length > 0 ? actionItemsRaw.map(a => `- [ ] ${a} — Owner: TBD
   });
 });
 
-// ── Health check ─────────────────────────────────────────────
-app.get("/health", (_req, res) => res.json({ ok: true, uptime: process.uptime(), time: nowET(), v: "1.4", meeting_active: meetingState.active }));
-app.get("/", (_req, res) => res.json({ ok: true, server: "cammy-vapi-tool-server", v: "1.4" }));
+// ============================================================
+// ENDPOINT: POST /call-complete  (NEW v1.5 — Full Memory Loop)
+// Called by PWA immediately after call-end event.
+// Body: { transcripts: [{role, text}], duration_sec, call_id? }
+//
+// Pipeline:
+//   1. GPT-4o-mini extracts tasks, commitments, decisions, new contacts
+//   2. Saves full call log to OneDrive /01 Logs/Call Log/
+//   3. Appends extracted items to decision_log Excel tab
+//   4. POSTs memory facts to MEMORY_WRITE_URL (Pipedream → Computer memory)
+// ============================================================
+app.post("/call-complete", async (req, res) => {
+  // Respond immediately so PWA doesn't hang
+  res.json({ ok: true, status: "processing" });
 
-app.listen(PORT, () => console.log(`[${nowET()}] Cammy Vapi Tool Server v1.4 on port ${PORT}`));
+  const transcripts = req.body?.transcripts || [];
+  const durationSec = req.body?.duration_sec || 0;
+  const callId = req.body?.call_id || `call_${Date.now()}`;
+  const dateISO = todayISOET();
+  const timestampET = nowET();
+
+  if (!transcripts.length) {
+    console.log(`[call-complete] ${callId} — no transcript, skipping`);
+    return;
+  }
+
+  // Build readable transcript text
+  const transcriptText = transcripts
+    .map(t => `${t.role === "user" ? "Ates" : "Cammy"}: ${t.text}`)
+    .join("\n");
+
+  console.log(`[call-complete] ${callId} — ${transcripts.length} turns, ${durationSec}s`);
+
+  // ── STEP 1: GPT-4o-mini extraction ────────────────────────
+  let extracted = null;
+  try {
+    const systemPrompt = `You are Cammy, an executive AI assistant. Analyze this voice conversation transcript between Ates Civitci and his AI assistant.
+
+Extract and return ONLY valid JSON (no markdown, no explanation) with this exact schema:
+{
+  "summary": "One sentence describing what this conversation was about.",
+  "tasks": [
+    { "description": "task description", "owner": "Ates or Cammy", "due": "date or null", "priority": "high|medium|low" }
+  ],
+  "commitments": [
+    { "description": "commitment or promise made", "by": "who made it", "to": "who it was made to", "due": "date or null" }
+  ],
+  "decisions": [
+    { "description": "decision made", "rationale": "brief reason or null" }
+  ],
+  "new_contacts": [
+    { "name": "full name", "role": "title or relationship", "notes": "context" }
+  ],
+  "memory_facts": [
+    "Short durable fact about Ates or his business, phrased as 'Remember that Ates ...' or 'Remember that Simple Smart AI ...'"
+  ],
+  "follow_ups": [
+    { "description": "follow-up needed", "deadline": "date or null" }
+  ]
+}
+
+Rules:
+- Only extract items explicitly mentioned. Do not infer or hallucinate.
+- If a section has nothing, return an empty array.
+- memory_facts should only be truly durable facts (not one-time events).
+- All dates in YYYY-MM-DD format if known, otherwise null.`;
+
+    const raw = await callOpenAI(systemPrompt, `Call ID: ${callId}\nDate: ${timestampET}\nDuration: ${durationSec}s\n\nTranscript:\n${transcriptText}`, 30000);
+
+    // Strip markdown code fences if present
+    const cleaned = raw.replace(/^```json\s*/i, "").replace(/```\s*$/i, "").trim();
+    extracted = JSON.parse(cleaned);
+    console.log(`[call-complete] extraction OK — tasks:${extracted.tasks?.length} commitments:${extracted.commitments?.length} decisions:${extracted.decisions?.length} facts:${extracted.memory_facts?.length}`);
+  } catch (err) {
+    console.error("[call-complete] GPT extraction failed:", err.message);
+    extracted = { summary: "GPT extraction failed", tasks: [], commitments: [], decisions: [], new_contacts: [], memory_facts: [], follow_ups: [] };
+  }
+
+  // ── STEP 2: Save call log to OneDrive ─────────────────────
+  try {
+    const logMd = `# Call Log: ${dateISO}\nCall ID: ${callId}\nTimestamp: ${timestampET}\nDuration: ${durationSec}s\n\n## Summary\n${extracted.summary}\n\n## Transcript\n${transcriptText}\n\n## Extracted Tasks\n${extracted.tasks?.map(t => `- [ ] ${t.description} (Owner: ${t.owner}, Due: ${t.due || "TBD"}, Priority: ${t.priority})`).join("\n") || "None"}\n\n## Commitments\n${extracted.commitments?.map(c => `- ${c.description} (By: ${c.by}, Due: ${c.due || "TBD"})`).join("\n") || "None"}\n\n## Decisions\n${extracted.decisions?.map(d => `- ${d.description}${d.rationale ? ` — ${d.rationale}` : ""}`).join("\n") || "None"}\n\n## New Contacts\n${extracted.new_contacts?.map(c => `- ${c.name} (${c.role}): ${c.notes}`).join("\n") || "None"}\n\n## Follow-Ups\n${extracted.follow_ups?.map(f => `- ${f.description} (by ${f.deadline || "TBD"})`).join("\n") || "None"}\n`;
+
+    const content_b64 = Buffer.from(logMd, "utf8").toString("base64");
+    await post(ONEDRIVE_ROUTER, {
+      filename: `${dateISO}_${callId}.md`,
+      content_b64,
+      force_folder: "01 Logs/Call Log",
+      overwrite: false,
+    }, {}, 20000);
+    console.log(`[call-complete] call log saved`);
+  } catch (err) {
+    console.error("[call-complete] OneDrive log save failed:", err.message);
+  }
+
+  // ── STEP 3: Append to decision_log Excel ──────────────────
+  // Uses the same microsoft_excel__pipedream pattern as cron_health
+  // We POST to a Pipedream workflow that calls add-row for each item
+  try {
+    const allItems = [
+      ...(extracted.tasks || []).map(t => ({
+        type: "TASK",
+        description: t.description,
+        owner: t.owner,
+        due: t.due || "",
+        priority: t.priority,
+        source: callId,
+        date: dateISO,
+      })),
+      ...(extracted.commitments || []).map(c => ({
+        type: "COMMITMENT",
+        description: c.description,
+        owner: c.by,
+        due: c.due || "",
+        priority: "high",
+        source: callId,
+        date: dateISO,
+      })),
+      ...(extracted.decisions || []).map(d => ({
+        type: "DECISION",
+        description: d.description,
+        owner: "Ates",
+        due: "",
+        priority: "medium",
+        source: callId,
+        date: dateISO,
+      })),
+    ];
+
+    if (allItems.length && MEMORY_WRITE_URL) {
+      await post(MEMORY_WRITE_URL, {
+        action: "decision_log_append",
+        items: allItems,
+        folder_id: EXCEL_FOLDER_ID,
+        sheet_id: EXCEL_SHEET_ID,
+      }, {}, 20000);
+      console.log(`[call-complete] decision log appended — ${allItems.length} rows`);
+    }
+  } catch (err) {
+    console.error("[call-complete] decision log append failed:", err.message);
+  }
+
+  // ── STEP 4: Write memory facts ────────────────────────────
+  // POST to Pipedream which calls Computer memory_update for each fact
+  try {
+    const facts = extracted.memory_facts || [];
+    const contacts = extracted.new_contacts || [];
+
+    // Also build contact facts
+    const contactFacts = contacts.map(c =>
+      `Remember that Ates knows ${c.name} who is ${c.role}. Context: ${c.notes}`
+    );
+
+    const allFacts = [...facts, ...contactFacts];
+
+    if (allFacts.length && MEMORY_WRITE_URL) {
+      await post(MEMORY_WRITE_URL, {
+        action: "memory_update",
+        facts: allFacts,
+        source: callId,
+        timestamp: timestampET,
+      }, {}, 20000);
+      console.log(`[call-complete] memory facts written — ${allFacts.length} facts`);
+    }
+  } catch (err) {
+    console.error("[call-complete] memory write failed:", err.message);
+  }
+
+  // ── STEP 5: Write staging file for morning briefing ───────
+  // Any high-priority tasks surface in tomorrow's briefing
+  try {
+    const urgentTasks = (extracted.tasks || []).filter(t => t.priority === "high");
+    const urgentCommitments = (extracted.commitments || []);
+
+    if (urgentTasks.length || urgentCommitments.length) {
+      const stagingItems = [
+        ...urgentTasks.map(t => ({
+          source: "voice_call",
+          priority: "URGENT",
+          section: "OPEN-LOOPS",
+          content: `Task from call ${callId}: ${t.description} (due ${t.due || "TBD"})`,
+          action_required: true,
+          action: `Assign to ${t.owner} and confirm deadline`,
+        })),
+        ...urgentCommitments.map(c => ({
+          source: "voice_call",
+          priority: "INFO",
+          section: "OPEN-LOOPS",
+          content: `Commitment from call: ${c.description} (by ${c.by}, due ${c.due || "TBD"})`,
+          action_required: true,
+          action: "Track and follow up",
+        })),
+      ];
+
+      const staging = {
+        generated_at: timestampET,
+        items: stagingItems,
+      };
+
+      const content_b64 = Buffer.from(JSON.stringify(staging, null, 2), "utf8").toString("base64");
+      await post(ONEDRIVE_ROUTER, {
+        filename: "morning_briefing_additions.json",
+        content_b64,
+        force_folder: "03 Staging",
+        overwrite: true,
+      }, {}, 20000);
+      console.log(`[call-complete] staging file updated — ${stagingItems.length} items`);
+    }
+  } catch (err) {
+    console.error("[call-complete] staging write failed:", err.message);
+  }
+
+  console.log(`[call-complete] ${callId} — pipeline complete`);
+});
+
+// ── Health check ─────────────────────────────────────────────
+app.get("/health", (_req, res) => res.json({ ok: true, uptime: process.uptime(), time: nowET(), v: "1.5", meeting_active: meetingState.active }));
+app.get("/", (_req, res) => res.json({ ok: true, server: "cammy-vapi-tool-server", v: "1.5" }));
+
+app.listen(PORT, () => console.log(`[${nowET()}] Cammy Vapi Tool Server v1.5 on port ${PORT}`));
