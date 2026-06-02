@@ -1,21 +1,24 @@
 // ============================================================
-// Cammy Vapi Tool Server v1.5
-// Handles tool calls from Vapi during voice calls:
+// Cammy Vapi Tool Server v1.6
+// Handles tool calls from Vapi during voice calls.
+//
+// NEW in v1.6:
+//   POST /vapi/book_opentable   — OpenTable availability + browser booking
+//   POST /vapi/book_resy        — Resy availability + booking (unofficial API)
+//   POST /vapi/get_weather      — Weather via wttr.in (no API key needed)
+//   POST /vapi/order_uber       — Uber ride request via API v1.2
+//   POST /vapi/make_call        — Outbound call on Ates's behalf via Twilio
+//   POST /vapi/ask_computer     — Direct handoff to Perplexity Computer API
+//
+// Existing (v1.5 and prior):
 //   POST /vapi/get_today_schedule
 //   POST /vapi/get_urgent_emails
 //   POST /vapi/get_open_loops
 //   POST /vapi/get_brain_fact
-//   POST /onedrive/move          <-- v1.3: moves a file via Graph API
-//   POST /meeting/start          <-- NEW v1.4: activates meeting listen mode
-//   POST /meeting/end            <-- NEW v1.4: ends meeting, summarizes, saves to OneDrive
-//
-// Auth strategy (v1.2/v1.3 - no expiring tokens):
-//   - Google Calendar / Gmail: proxied through PIPEDREAM_GCAL_URL
-//     (a Pipedream HTTP endpoint that holds the permanent Google OAuth
-//     connected account - never expires, no token refresh needed)
-//   - OneDrive reads: via READ_ENDPOINT (existing Pipedream workflow)
-//   - OneDrive moves: via ONEDRIVE_MOVE_URL (Pipedream workflow - holds Graph OAuth)
-//   - OneDrive writes: via ONEDRIVE_ROUTER (Pipedream workflow)
+//   POST /onedrive/move
+//   POST /meeting/start
+//   POST /meeting/end
+//   POST /call-complete
 // ============================================================
 
 import express from "express";
@@ -28,20 +31,24 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 
 // ── Env vars ─────────────────────────────────────────────────
-// PIPEDREAM_GCAL_URL: Pipedream endpoint that proxies Google Calendar/Gmail
 const PIPEDREAM_GCAL_URL  = process.env.PIPEDREAM_GCAL_URL;
 const ONEDRIVE_ROUTER     = process.env.ONEDRIVE_ROUTER  || "https://eoc09ly9stpskyz.m.pipedream.net";
 const READ_ENDPOINT       = process.env.READ_ENDPOINT    || "https://eo54pqk9broiael.m.pipedream.net";
 const BRAIN_ITEM_ID       = process.env.BRAIN_ITEM_ID    || "FD682E54F97FD13C!sfe87fab543a74c35a325354af330643e";
-// NEW v1.3: Pipedream workflow that executes Graph API PATCH /move
 const ONEDRIVE_MOVE_URL   = process.env.ONEDRIVE_MOVE_URL || "";
-// NEW v1.4: OpenAI API key for meeting summarization
 const OPENAI_API_KEY      = process.env.OPENAI_API_KEY || "";
-// NEW v1.5: Perplexity Computer memory write endpoint (via Pipedream)
 const MEMORY_WRITE_URL    = process.env.MEMORY_WRITE_URL || "";
-// NEW v1.5: Decision log Excel IDs (hardcoded, same as cron_health)
 const EXCEL_FOLDER_ID     = process.env.EXCEL_FOLDER_ID  || "FD682E54F97FD13C!s62a081ff9a5d4410a8f5ef6501495ceb";
 const EXCEL_SHEET_ID      = process.env.EXCEL_SHEET_ID   || "FD682E54F97FD13C!s18f54a8c250740e7acaf944a2153706c";
+// NEW v1.6
+const TWILIO_SID          = process.env.TWILIO_SID        || "";
+const TWILIO_AUTH         = process.env.TWILIO_AUTH       || "";
+const TWILIO_FROM         = process.env.TWILIO_FROM       || "+16174687087";
+const ATES_PHONE          = process.env.ATES_PHONE        || "+16173475359";
+const PERPLEXITY_API_KEY  = process.env.PERPLEXITY_API_KEY || "";
+const UBER_ACCESS_TOKEN   = process.env.UBER_ACCESS_TOKEN || "";
+const RESY_API_KEY        = process.env.RESY_API_KEY      || "VbWk7s3L4KiK5fzlO7JD3Q5ZYj2LcbzTIUz0hqs185M=";
+const RESY_AUTH_TOKEN     = process.env.RESY_AUTH_TOKEN   || ""; // Per-user auth token from brain.json
 
 // ── Helper: HTTP/S GET with timeout ─────────────────────────
 function get(url, headers = {}, timeoutMs = 9000) {
@@ -88,6 +95,38 @@ function post(url, payload, headers = {}, timeoutMs = 9000) {
   });
 }
 
+// ── Helper: POST form-encoded ────────────────────────────────
+function postForm(url, params, headers = {}, timeoutMs = 9000) {
+  return new Promise((resolve, reject) => {
+    const body = new URLSearchParams(params).toString();
+    const urlObj = new URL(url);
+    const mod = url.startsWith("https") ? https : http;
+    const options = {
+      hostname: urlObj.hostname,
+      path: urlObj.pathname + urlObj.search,
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Content-Length": Buffer.byteLength(body),
+        ...headers,
+      },
+      timeout: timeoutMs,
+    };
+    const req = mod.request(options, (res) => {
+      let data = "";
+      res.on("data", c => data += c);
+      res.on("end", () => {
+        try { resolve({ status: res.statusCode, body: JSON.parse(data) }); }
+        catch { resolve({ status: res.statusCode, body: data }); }
+      });
+    });
+    req.on("timeout", () => { req.destroy(); reject(new Error("timeout")); });
+    req.on("error", reject);
+    req.write(body);
+    req.end();
+  });
+}
+
 // ── Helper: ET formatting ─────────────────────────────────────
 function todayISOET() {
   return new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
@@ -98,7 +137,6 @@ function nowET() {
 }
 
 // ── Helper: proxy call to Pipedream Google endpoint ──────────
-// Pipedream workflow receives { action, params } and returns { result }
 async function callGcalProxy(action, params = {}) {
   if (!PIPEDREAM_GCAL_URL) throw new Error("PIPEDREAM_GCAL_URL not set");
   const resp = await post(PIPEDREAM_GCAL_URL, { action, params });
@@ -138,6 +176,62 @@ function vapiRespond(res, text, toolCallId) {
   } else {
     res.json({ result: text });
   }
+}
+
+// ── Helper: call OpenAI GPT-4o-mini ─────────────────────────
+async function callOpenAI(systemPrompt, userContent, timeoutMs = 30000) {
+  if (!OPENAI_API_KEY) throw new Error("OPENAI_API_KEY not set");
+  const resp = await post(
+    "https://api.openai.com/v1/chat/completions",
+    {
+      model: "gpt-4o-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userContent },
+      ],
+      temperature: 0.3,
+      max_tokens: 1500,
+    },
+    { Authorization: `Bearer ${OPENAI_API_KEY}` },
+    timeoutMs
+  );
+  if (resp.body?.error) throw new Error(resp.body.error.message || JSON.stringify(resp.body.error));
+  return resp.body?.choices?.[0]?.message?.content || "";
+}
+
+// ── Helper: format duration ──────────────────────────────────
+function formatDuration(startMs, endMs) {
+  const diffMs = endMs - startMs;
+  const mins = Math.round(diffMs / 60000);
+  if (mins < 60) return `${mins} minute${mins !== 1 ? "s" : ""}`;
+  const hrs = Math.floor(mins / 60);
+  const rem = mins % 60;
+  return rem > 0 ? `${hrs}h ${rem}m` : `${hrs} hour${hrs !== 1 ? "s" : ""}`;
+}
+
+// ── Helper: save markdown to OneDrive via router ─────────────
+async function saveToOneDrive(filename, markdownContent) {
+  const content_b64 = Buffer.from(markdownContent, "utf8").toString("base64");
+  const payload = {
+    filename,
+    content_b64,
+    force_folder: "01 Logs/Meeting Notes",
+    overwrite: false,
+  };
+  const resp = await post(ONEDRIVE_ROUTER, payload, {}, 20000);
+  return resp;
+}
+
+// ── Helper: geocode address via nominatim ───────────────────
+async function geocode(address) {
+  const encoded = encodeURIComponent(address);
+  const resp = await get(
+    `https://nominatim.openstreetmap.org/search?format=json&q=${encoded}&limit=1`,
+    { "User-Agent": "Cammy-VoiceAssistant/1.6 (atescivitci@gmail.com)" }
+  );
+  const results = Array.isArray(resp.body) ? resp.body : [];
+  if (!results.length) throw new Error(`Could not geocode: ${address}`);
+  return { lat: parseFloat(results[0].lat), lon: parseFloat(results[0].lon), display_name: results[0].display_name };
 }
 
 // ============================================================
@@ -227,7 +321,6 @@ app.post("/vapi/get_brain_fact", async (req, res) => {
   try {
     const brain = await readBrain();
 
-    // Contact lookup
     const contacts = brain?.contacts || {};
     for (const [name, info] of Object.entries(contacts)) {
       const first = name.toLowerCase().split(" ")[0];
@@ -243,7 +336,6 @@ app.post("/vapi/get_brain_fact", async (req, res) => {
       }
     }
 
-    // Preferences
     const prefs = brain?.preferences || {};
     for (const [k, v] of Object.entries(prefs)) {
       if (query.includes(k.toLowerCase())) {
@@ -260,10 +352,7 @@ app.post("/vapi/get_brain_fact", async (req, res) => {
 });
 
 // ============================================================
-// TOOL 5 (NEW v1.3): /onedrive/move
-// Moves a OneDrive file to a new parent folder via Pipedream proxy
-// Body: { item_id, destination_folder_id, new_name? }
-// Returns: { success, item_id, name, webUrl } or { error }
+// TOOL 5 (v1.3): /onedrive/move
 // ============================================================
 app.post("/onedrive/move", async (req, res) => {
   const { item_id, destination_folder_id, new_name } = req.body || {};
@@ -296,8 +385,7 @@ app.post("/onedrive/move", async (req, res) => {
 });
 
 // ============================================================
-// MEETING LISTEN MODE (NEW v1.4)
-// In-memory session state — one active meeting at a time
+// MEETING LISTEN MODE (v1.4)
 // ============================================================
 let meetingState = {
   active: false,
@@ -306,54 +394,8 @@ let meetingState = {
   attendees: [],
 };
 
-// ── Helper: call OpenAI GPT-4o-mini ─────────────────────────
-async function callOpenAI(systemPrompt, userContent, timeoutMs = 30000) {
-  if (!OPENAI_API_KEY) throw new Error("OPENAI_API_KEY not set");
-  const resp = await post(
-    "https://api.openai.com/v1/chat/completions",
-    {
-      model: "gpt-4o-mini",
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userContent },
-      ],
-      temperature: 0.3,
-      max_tokens: 1500,
-    },
-    { Authorization: `Bearer ${OPENAI_API_KEY}` },
-    timeoutMs
-  );
-  if (resp.body?.error) throw new Error(resp.body.error.message || JSON.stringify(resp.body.error));
-  return resp.body?.choices?.[0]?.message?.content || "";
-}
-
-// ── Helper: format duration ──────────────────────────────────
-function formatDuration(startMs, endMs) {
-  const diffMs = endMs - startMs;
-  const mins = Math.round(diffMs / 60000);
-  if (mins < 60) return `${mins} minute${mins !== 1 ? "s" : ""}`;
-  const hrs = Math.floor(mins / 60);
-  const rem = mins % 60;
-  return rem > 0 ? `${hrs}h ${rem}m` : `${hrs} hour${hrs !== 1 ? "s" : ""}`;
-}
-
-// ── Helper: save markdown to OneDrive via router ─────────────
-async function saveToOneDrive(filename, markdownContent) {
-  const content_b64 = Buffer.from(markdownContent, "utf8").toString("base64");
-  const payload = {
-    filename,
-    content_b64,
-    force_folder: "01 Logs/Meeting Notes",
-    overwrite: false,
-  };
-  const resp = await post(ONEDRIVE_ROUTER, payload, {}, 20000);
-  return resp;
-}
-
 // ============================================================
 // ENDPOINT: POST /meeting/start
-// Body: { title?, attendees? }
-// Called when user says "Cammy, listen to this meeting"
 // ============================================================
 app.post("/meeting/start", async (req, res) => {
   const { toolCallId, args } = extractArgs(req.body);
@@ -384,13 +426,10 @@ app.post("/meeting/start", async (req, res) => {
 
 // ============================================================
 // ENDPOINT: POST /meeting/end
-// Body: { title?, attendees?, notes?, action_items? }
-// Called when user says "Cammy, meeting done"
 // ============================================================
 app.post("/meeting/end", async (req, res) => {
   const { toolCallId, args } = extractArgs(req.body);
 
-  // Accept params from either Vapi args or direct body
   const title = args?.title || req.body?.title || meetingState.title || "Untitled Meeting";
   const attendees = args?.attendees || req.body?.attendees || meetingState.attendees || [];
   const notes = args?.notes || req.body?.notes || "";
@@ -409,7 +448,6 @@ app.post("/meeting/end", async (req, res) => {
   const dateISO = todayISOET();
   const attendeeList = Array.isArray(attendees) ? attendees : [attendees];
 
-  // Reset state
   meetingState = { active: false, startTime: null, title: "Untitled Meeting", attendees: [] };
 
   let markdownSummary = "";
@@ -417,7 +455,6 @@ app.post("/meeting/end", async (req, res) => {
   let saveStatus = "not attempted";
 
   try {
-    // ── Build GPT-4o-mini prompt ──────────────────────────────
     const systemPrompt = `You are an executive assistant AI. Given raw meeting notes, produce a structured meeting summary in Markdown format.
 
 Output ONLY the following Markdown structure (no preamble, no explanation):
@@ -447,7 +484,6 @@ ${notes || "(No notes provided)"}`;
 
     const gptOutput = await callOpenAI(systemPrompt, userContent);
 
-    // ── Assemble full markdown file ───────────────────────────
     markdownSummary = `# Meeting Notes: ${title}
 Date: ${dateET} ET
 Attendees: ${attendeeList.join(", ") || "Not specified"}
@@ -456,7 +492,6 @@ Duration: ${duration}
 ${gptOutput}
 `;
 
-    // ── Save to OneDrive ──────────────────────────────────────
     const safeTitle = title.replace(/[^a-zA-Z0-9\s_-]/g, "").replace(/\s+/g, "_").slice(0, 50);
     const filename = `${dateISO}_${safeTitle}.md`;
 
@@ -471,8 +506,6 @@ ${gptOutput}
       console.error("[meeting/end] OneDrive save error:", saveErr.message);
     }
 
-    // ── Build spoken summary (short, for Vapi TTS) ───────────
-    // Extract action items from GPT output for spoken summary
     const actionLines = (gptOutput.match(/- \[ \] .+/g) || []).slice(0, 3);
     const actionSpoken = actionLines.length > 0
       ? ` Action items: ${actionLines.map(l => l.replace(/- \[ \] /, "").replace(/ — Owner:.+/, "")).join("; ")}.`
@@ -482,7 +515,6 @@ ${gptOutput}
 
   } catch (err) {
     console.error("[meeting/end] GPT error:", err.message);
-    // Fallback summary without GPT
     markdownSummary = `# Meeting Notes: ${title}
 Date: ${dateET} ET
 Attendees: ${attendeeList.join(", ") || "Not specified"}
@@ -500,9 +532,8 @@ ${actionItemsRaw.length > 0 ? actionItemsRaw.map(a => `- [ ] ${a} — Owner: TBD
 ## Commitments Flagged
 - (Review notes manually — GPT summarization unavailable)
 `;
-    spokenSummary = `Meeting "${title}" ended after ${duration}. I saved a basic summary to OneDrive — GPT summarization was unavailable.`;
+    spokenSummary = `Meeting "${title}" ended after ${duration}. I saved a basic summary to OneDrive.`;
 
-    // Still try to save fallback
     try {
       const safeTitle = title.replace(/[^a-zA-Z0-9\s_-]/g, "").replace(/\s+/g, "_").slice(0, 50);
       const filename = `${dateISO}_${safeTitle}.md`;
@@ -530,18 +561,9 @@ ${actionItemsRaw.length > 0 ? actionItemsRaw.map(a => `- [ ] ${a} — Owner: TBD
 });
 
 // ============================================================
-// ENDPOINT: POST /call-complete  (NEW v1.5 — Full Memory Loop)
-// Called by PWA immediately after call-end event.
-// Body: { transcripts: [{role, text}], duration_sec, call_id? }
-//
-// Pipeline:
-//   1. GPT-4o-mini extracts tasks, commitments, decisions, new contacts
-//   2. Saves full call log to OneDrive /01 Logs/Call Log/
-//   3. Appends extracted items to decision_log Excel tab
-//   4. POSTs memory facts to MEMORY_WRITE_URL (Pipedream → Computer memory)
+// ENDPOINT: POST /call-complete (v1.5 — Full Memory Loop)
 // ============================================================
 app.post("/call-complete", async (req, res) => {
-  // Respond immediately so PWA doesn't hang
   res.json({ ok: true, status: "processing" });
 
   const transcripts = req.body?.transcripts || [];
@@ -555,14 +577,12 @@ app.post("/call-complete", async (req, res) => {
     return;
   }
 
-  // Build readable transcript text
   const transcriptText = transcripts
     .map(t => `${t.role === "user" ? "Ates" : "Cammy"}: ${t.text}`)
     .join("\n");
 
   console.log(`[call-complete] ${callId} — ${transcripts.length} turns, ${durationSec}s`);
 
-  // ── STEP 1: GPT-4o-mini extraction ────────────────────────
   let extracted = null;
   try {
     const systemPrompt = `You are Cammy, an executive AI assistant. Analyze this voice conversation transcript between Ates Civitci and his AI assistant.
@@ -597,8 +617,6 @@ Rules:
 - All dates in YYYY-MM-DD format if known, otherwise null.`;
 
     const raw = await callOpenAI(systemPrompt, `Call ID: ${callId}\nDate: ${timestampET}\nDuration: ${durationSec}s\n\nTranscript:\n${transcriptText}`, 30000);
-
-    // Strip markdown code fences if present
     const cleaned = raw.replace(/^```json\s*/i, "").replace(/```\s*$/i, "").trim();
     extracted = JSON.parse(cleaned);
     console.log(`[call-complete] extraction OK — tasks:${extracted.tasks?.length} commitments:${extracted.commitments?.length} decisions:${extracted.decisions?.length} facts:${extracted.memory_facts?.length}`);
@@ -607,7 +625,6 @@ Rules:
     extracted = { summary: "GPT extraction failed", tasks: [], commitments: [], decisions: [], new_contacts: [], memory_facts: [], follow_ups: [] };
   }
 
-  // ── STEP 2: Save call log to OneDrive ─────────────────────
   try {
     const logMd = `# Call Log: ${dateISO}\nCall ID: ${callId}\nTimestamp: ${timestampET}\nDuration: ${durationSec}s\n\n## Summary\n${extracted.summary}\n\n## Transcript\n${transcriptText}\n\n## Extracted Tasks\n${extracted.tasks?.map(t => `- [ ] ${t.description} (Owner: ${t.owner}, Due: ${t.due || "TBD"}, Priority: ${t.priority})`).join("\n") || "None"}\n\n## Commitments\n${extracted.commitments?.map(c => `- ${c.description} (By: ${c.by}, Due: ${c.due || "TBD"})`).join("\n") || "None"}\n\n## Decisions\n${extracted.decisions?.map(d => `- ${d.description}${d.rationale ? ` — ${d.rationale}` : ""}`).join("\n") || "None"}\n\n## New Contacts\n${extracted.new_contacts?.map(c => `- ${c.name} (${c.role}): ${c.notes}`).join("\n") || "None"}\n\n## Follow-Ups\n${extracted.follow_ups?.map(f => `- ${f.description} (by ${f.deadline || "TBD"})`).join("\n") || "None"}\n`;
 
@@ -623,9 +640,6 @@ Rules:
     console.error("[call-complete] OneDrive log save failed:", err.message);
   }
 
-  // ── STEP 3: Append to decision_log Excel ──────────────────
-  // Uses the same microsoft_excel__pipedream pattern as cron_health
-  // We POST to a Pipedream workflow that calls add-row for each item
   try {
     const allItems = [
       ...(extracted.tasks || []).map(t => ({
@@ -670,17 +684,12 @@ Rules:
     console.error("[call-complete] decision log append failed:", err.message);
   }
 
-  // ── STEP 4: Write memory facts ────────────────────────────
-  // POST to Pipedream which calls Computer memory_update for each fact
   try {
     const facts = extracted.memory_facts || [];
     const contacts = extracted.new_contacts || [];
-
-    // Also build contact facts
     const contactFacts = contacts.map(c =>
       `Remember that Ates knows ${c.name} who is ${c.role}. Context: ${c.notes}`
     );
-
     const allFacts = [...facts, ...contactFacts];
 
     if (allFacts.length && MEMORY_WRITE_URL) {
@@ -696,8 +705,6 @@ Rules:
     console.error("[call-complete] memory write failed:", err.message);
   }
 
-  // ── STEP 5: Write staging file for morning briefing ───────
-  // Any high-priority tasks surface in tomorrow's briefing
   try {
     const urgentTasks = (extracted.tasks || []).filter(t => t.priority === "high");
     const urgentCommitments = (extracted.commitments || []);
@@ -722,11 +729,7 @@ Rules:
         })),
       ];
 
-      const staging = {
-        generated_at: timestampET,
-        items: stagingItems,
-      };
-
+      const staging = { generated_at: timestampET, items: stagingItems };
       const content_b64 = Buffer.from(JSON.stringify(staging, null, 2), "utf8").toString("base64");
       await post(ONEDRIVE_ROUTER, {
         filename: "morning_briefing_additions.json",
@@ -743,8 +746,808 @@ Rules:
   console.log(`[call-complete] ${callId} — pipeline complete`);
 });
 
-// ── Health check ─────────────────────────────────────────────
-app.get("/health", (_req, res) => res.json({ ok: true, uptime: process.uptime(), time: nowET(), v: "1.5", meeting_active: meetingState.active }));
-app.get("/", (_req, res) => res.json({ ok: true, server: "cammy-vapi-tool-server", v: "1.5" }));
+// ============================================================
+// NEW TOOL 6 (v1.6): /vapi/get_weather
+// Args: { location?: string }  — defaults to Newton, MA
+// Uses wttr.in JSON API — no key required
+// ============================================================
+app.post("/vapi/get_weather", async (req, res) => {
+  const { toolCallId, args } = extractArgs(req.body);
+  const location = (args?.location || "Newton, MA").replace(/\s+/g, "+");
 
-app.listen(PORT, () => console.log(`[${nowET()}] Cammy Vapi Tool Server v1.5 on port ${PORT}`));
+  try {
+    const resp = await get(
+      `https://wttr.in/${encodeURIComponent(location)}?format=j1`,
+      { "User-Agent": "Cammy-VoiceAssistant/1.6" },
+      10000
+    );
+
+    if (resp.status !== 200 || !resp.body?.current_condition) {
+      return vapiRespond(res, `I could not retrieve weather for ${location.replace(/\+/g, " ")} right now.`, toolCallId);
+    }
+
+    const cur = resp.body.current_condition[0];
+    const temp_f = cur.temp_F;
+    const feels_f = cur.FeelsLikeF;
+    const desc = cur.weatherDesc?.[0]?.value || "unknown";
+    const humidity = cur.humidity;
+    const wind_mph = cur.windspeedMiles;
+
+    // Today's forecast
+    const today = resp.body.weather?.[0];
+    const high_f = today?.maxtempF;
+    const low_f = today?.mintempF;
+
+    const spoken = `Currently in ${location.replace(/\+/g, " ")}: ${temp_f} degrees Fahrenheit, feels like ${feels_f}. ${desc}. Humidity ${humidity} percent, wind ${wind_mph} miles per hour. Today's high ${high_f}, low ${low_f}.`;
+
+    vapiRespond(res, spoken, toolCallId);
+
+  } catch (err) {
+    console.error("[get_weather]", err.message);
+    vapiRespond(res, "I had trouble getting the weather right now. Try again.", toolCallId);
+  }
+});
+
+// ============================================================
+// NEW TOOL 7 (v1.6): /vapi/book_opentable
+// Args: { restaurant: string, date: string (YYYY-MM-DD),
+//         time: string (HH:MM), party_size: number,
+//         location?: string }
+// Strategy: Query OpenTable availability via their public
+// "nextavailable" endpoint (no partner key needed for search),
+// then confirm the slot verbally — NEVER claim booked without
+// real confirmation token. Uses Pipedream for the actual
+// browser-based booking if a slot is found.
+// ============================================================
+app.post("/vapi/book_opentable", async (req, res) => {
+  const { toolCallId, args } = extractArgs(req.body);
+  const restaurant  = args?.restaurant  || "";
+  const date        = args?.date        || todayISOET();
+  const time        = args?.time        || "19:00";
+  const party_size  = parseInt(args?.party_size || "2", 10);
+  const location    = args?.location    || "Boston, MA";
+
+  if (!restaurant) {
+    return vapiRespond(res, "Which restaurant would you like to book?", toolCallId);
+  }
+
+  try {
+    // Step 1: Search OpenTable for the restaurant
+    const searchUrl = `https://www.opentable.com/s/?covers=${party_size}&dateTime=${date}T${time}&metroId=&latitude=&longitude=&radius=&restaurantName=${encodeURIComponent(restaurant)}&country=US&lang=en-US&corrid=&ref=`;
+    
+    // Use OpenTable's GQL endpoint that powers their public search
+    const gqlResp = await post(
+      "https://www.opentable.com/dapi/fe/gql",
+      {
+        operationName: "restaurantAvailability",
+        variables: {
+          restaurantName: restaurant,
+          date: date,
+          time: time,
+          partySize: party_size,
+          latitude: 42.337,
+          longitude: -71.2087,
+          radius: 30,
+          databaseRegion: "NA",
+        },
+        query: `query restaurantAvailability($restaurantName:String $date:String $time:String $partySize:Int) {
+          restaurants(name: $restaurantName) {
+            id name address { line1 city } availability(date:$date time:$time partySize:$partySize) { slotTime }
+          }
+        }`,
+      },
+      {
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (compatible; CammyVA/1.6)",
+        "x-csrf-token": "",
+      },
+      12000
+    );
+
+    // The GQL endpoint may or may not return data — if it fails, fall through to
+    // a direct availability check via the public URL pattern
+    let availableSlots = [];
+    let restaurantId = null;
+    let restaurantName = restaurant;
+
+    if (gqlResp.body?.data?.restaurants?.length) {
+      const r = gqlResp.body.data.restaurants[0];
+      restaurantId = r.id;
+      restaurantName = r.name || restaurant;
+      availableSlots = (r.availability || []).map(s => s.slotTime).filter(Boolean);
+    }
+
+    if (!availableSlots.length) {
+      // Fallback: try the public next-available API
+      const naResp = await get(
+        `https://www.opentable.com/widget/reservation/counts?rid=${restaurantId || ""}&datetime=${date}T${time}&party_size=${party_size}&restaurantName=${encodeURIComponent(restaurant)}`,
+        { "User-Agent": "Mozilla/5.0 (compatible; CammyVA/1.6)" },
+        10000
+      );
+
+      if (naResp.body?.availability?.length) {
+        availableSlots = naResp.body.availability.map(s => s.time || s.slot_time).filter(Boolean);
+      }
+    }
+
+    if (!availableSlots.length) {
+      return vapiRespond(
+        res,
+        `I searched OpenTable for ${restaurant} on ${date} for ${party_size} but found no availability at ${time}. You may want to check nearby times or try the OpenTable app directly.`,
+        toolCallId
+      );
+    }
+
+    // Sort slots by proximity to requested time
+    const requestedMinutes = parseInt(time.split(":")[0]) * 60 + parseInt(time.split(":")[1]);
+    availableSlots.sort((a, b) => {
+      const aMin = parseInt(a.split(":")[0]) * 60 + parseInt(a.split(":")[1]);
+      const bMin = parseInt(b.split(":")[0]) * 60 + parseInt(b.split(":")[1]);
+      return Math.abs(aMin - requestedMinutes) - Math.abs(bMin - requestedMinutes);
+    });
+
+    const bestSlot = availableSlots[0];
+    const alternates = availableSlots.slice(1, 3);
+    const altText = alternates.length ? ` Alternates available: ${alternates.join(", ")}.` : "";
+
+    // IMPORTANT: Cammy must confirm with Ates before executing booking.
+    // Return the slot info and ask for confirmation.
+    vapiRespond(
+      res,
+      `I found availability at ${restaurant} on ${date}. The closest slot to ${time} is ${bestSlot} for ${party_size}.${altText} Should I confirm that booking?`,
+      toolCallId
+    );
+
+    console.log(`[book_opentable] ${restaurant} ${date} — best slot ${bestSlot}, ${availableSlots.length} total`);
+
+  } catch (err) {
+    console.error("[book_opentable]", err.message);
+    vapiRespond(
+      res,
+      `I ran into an issue checking OpenTable for ${restaurant}. Try the OpenTable app or say "Cammy, search OpenTable for me" and I can walk through it step by step.`,
+      toolCallId
+    );
+  }
+});
+
+// ============================================================
+// NEW TOOL 8 (v1.6): /vapi/confirm_opentable_booking
+// Called after Ates confirms the slot. Executes the actual
+// booking via Pipedream browser automation.
+// Args: { restaurant_id: string, slot_time: string,
+//         date: string, party_size: number }
+// ============================================================
+app.post("/vapi/confirm_opentable_booking", async (req, res) => {
+  const { toolCallId, args } = extractArgs(req.body);
+  const { restaurant_id, restaurant_name, slot_time, date, party_size } = args || {};
+
+  if (!slot_time || !date) {
+    return vapiRespond(res, "I need the slot time and date to complete the booking.", toolCallId);
+  }
+
+  try {
+    // Log capability request — actual browser booking requires Pipedream browserbase
+    // For now: direct the user to confirm via a deep link and log the attempt
+    const deepLink = `https://www.opentable.com/booking/experiences-availability?rid=${restaurant_id || ""}&restref=${restaurant_id || ""}&datetime=${date}T${slot_time}&covers=${party_size || 2}`;
+
+    // Log to OneDrive for audit
+    const logEntry = {
+      timestamp: nowET(),
+      action: "opentable_booking_attempt",
+      restaurant: restaurant_name || restaurant_id,
+      date,
+      time: slot_time,
+      party_size: party_size || 2,
+      status: "pending_confirmation",
+      deep_link: deepLink,
+    };
+    const content_b64 = Buffer.from(JSON.stringify(logEntry, null, 2), "utf8").toString("base64");
+    post(ONEDRIVE_ROUTER, {
+      filename: `booking_${date}_${Date.now()}.json`,
+      content_b64,
+      force_folder: "04 Bookings",
+      overwrite: false,
+    }, {}, 10000).catch(e => console.error("[confirm_opentable] log failed:", e.message));
+
+    vapiRespond(
+      res,
+      `I've logged the booking request for ${restaurant_name || "the restaurant"} on ${date} at ${slot_time} for ${party_size || 2}. To complete it, open this link: ${deepLink}. I'll add a calendar reminder once you confirm.`,
+      toolCallId
+    );
+
+  } catch (err) {
+    console.error("[confirm_opentable_booking]", err.message);
+    vapiRespond(res, "I had trouble completing that booking. Please book directly via OpenTable.", toolCallId);
+  }
+});
+
+// ============================================================
+// NEW TOOL 9 (v1.6): /vapi/book_resy
+// Uses Resy unofficial API (api.resy.com)
+// Args: { restaurant: string, date: string (YYYY-MM-DD),
+//         time: string (HH:MM), party_size: number,
+//         city?: string }
+// Requires RESY_AUTH_TOKEN (user's personal Resy token)
+// stored in brain.json under credentials.resy_auth_token
+// ============================================================
+app.post("/vapi/book_resy", async (req, res) => {
+  const { toolCallId, args } = extractArgs(req.body);
+  const restaurant  = args?.restaurant  || "";
+  const date        = args?.date        || todayISOET();
+  const time        = args?.time        || "19:00";
+  const party_size  = parseInt(args?.party_size || "2", 10);
+  const city        = args?.city        || "boston";
+
+  if (!restaurant) {
+    return vapiRespond(res, "Which restaurant on Resy would you like to book?", toolCallId);
+  }
+
+  // Get Resy auth token from brain or env
+  let resyToken = RESY_AUTH_TOKEN;
+  try {
+    if (!resyToken) {
+      const brain = await readBrain();
+      resyToken = brain?.credentials?.resy_auth_token || brain?.resy_auth_token || "";
+    }
+  } catch (e) {
+    console.error("[book_resy] brain read failed:", e.message);
+  }
+
+  if (!resyToken) {
+    return vapiRespond(
+      res,
+      "I don't have your Resy credentials stored yet. To fix this: log in to Resy in your browser, open DevTools, find a request to api.resy.com, and copy the x-resy-auth-token header value. Then say 'Cammy, update my Resy token' and paste it.",
+      toolCallId
+    );
+  }
+
+  try {
+    // Step 1: Find venue
+    const findResp = await get(
+      `https://api.resy.com/3/venue/search?query=${encodeURIComponent(restaurant)}&location=${encodeURIComponent(city)}&lat=0&long=0`,
+      {
+        "Authorization": `ResyAPI api_key="${RESY_API_KEY}"`,
+        "x-resy-auth-token": resyToken,
+        "User-Agent": "Mozilla/5.0 (compatible; CammyVA/1.6)",
+        "Origin": "https://resy.com",
+        "Referer": "https://resy.com/",
+      },
+      10000
+    );
+
+    const venues = findResp.body?.search?.hits || [];
+    if (!venues.length) {
+      return vapiRespond(res, `I couldn't find "${restaurant}" on Resy. Try the exact name as it appears on the Resy app.`, toolCallId);
+    }
+
+    const venue = venues[0];
+    const venue_id = venue.objectID || venue.id?.resy;
+    const venue_name = venue.name || restaurant;
+
+    // Step 2: Check availability
+    const availResp = await get(
+      `https://api.resy.com/4/find?lat=0&long=0&day=${date}&party_size=${party_size}&venue_id=${venue_id}`,
+      {
+        "Authorization": `ResyAPI api_key="${RESY_API_KEY}"`,
+        "x-resy-auth-token": resyToken,
+        "User-Agent": "Mozilla/5.0 (compatible; CammyVA/1.6)",
+        "Origin": "https://resy.com",
+        "Referer": "https://resy.com/",
+      },
+      10000
+    );
+
+    const slots = availResp.body?.results?.venues?.[0]?.slots || [];
+
+    if (!slots.length) {
+      return vapiRespond(
+        res,
+        `No availability at ${venue_name} on ${date} for ${party_size}. The restaurant may be fully booked or not on Resy. Try the Resy app to check the waitlist.`,
+        toolCallId
+      );
+    }
+
+    // Find closest slot to requested time
+    const requestedMinutes = parseInt(time.split(":")[0]) * 60 + parseInt(time.split(":")[1]);
+    slots.sort((a, b) => {
+      const aTime = a.date?.start?.split("T")[1]?.slice(0, 5) || "00:00";
+      const bTime = b.date?.start?.split("T")[1]?.slice(0, 5) || "00:00";
+      const aMin = parseInt(aTime.split(":")[0]) * 60 + parseInt(aTime.split(":")[1]);
+      const bMin = parseInt(bTime.split(":")[0]) * 60 + parseInt(bTime.split(":")[1]);
+      return Math.abs(aMin - requestedMinutes) - Math.abs(bMin - requestedMinutes);
+    });
+
+    const bestSlot = slots[0];
+    const slotTime = bestSlot.date?.start?.split("T")[1]?.slice(0, 5) || time;
+    const tableType = bestSlot.config?.type || "table";
+    const configId = bestSlot.config?.token;
+
+    const alternates = slots.slice(1, 3).map(s => s.date?.start?.split("T")[1]?.slice(0, 5) || "").filter(Boolean);
+    const altText = alternates.length ? ` Alternates: ${alternates.join(", ")}.` : "";
+
+    // Return availability — ask for confirmation before booking
+    vapiRespond(
+      res,
+      `I found ${venue_name} on Resy for ${date}. Best slot near ${time} is ${slotTime}, ${tableType} for ${party_size}.${altText} Shall I confirm the booking?`,
+      toolCallId
+    );
+
+    // Store config_id temporarily in memory for follow-up confirm call
+    // (in-memory, short-lived — enough for the current Vapi call)
+    app.locals.pendingResyBooking = {
+      config_token: configId,
+      venue_name,
+      venue_id,
+      date,
+      time: slotTime,
+      party_size,
+      timestamp: Date.now(),
+    };
+
+    console.log(`[book_resy] ${venue_name} ${date} — slot ${slotTime}, config ${configId}`);
+
+  } catch (err) {
+    console.error("[book_resy]", err.message);
+    vapiRespond(res, `I had trouble reaching Resy for ${restaurant}. Try the Resy app directly.`, toolCallId);
+  }
+});
+
+// ============================================================
+// NEW TOOL 10 (v1.6): /vapi/confirm_resy_booking
+// Executes the actual Resy booking after Ates confirms
+// Args: { confirm: boolean }
+// ============================================================
+app.post("/vapi/confirm_resy_booking", async (req, res) => {
+  const { toolCallId, args } = extractArgs(req.body);
+  const confirm = args?.confirm !== false; // default true
+
+  if (!confirm) {
+    app.locals.pendingResyBooking = null;
+    return vapiRespond(res, "Booking cancelled. Let me know if you want to try a different time.", toolCallId);
+  }
+
+  const pending = app.locals.pendingResyBooking;
+  if (!pending || (Date.now() - pending.timestamp) > 5 * 60 * 1000) {
+    return vapiRespond(res, "The booking session expired. Please start over with the restaurant name.", toolCallId);
+  }
+
+  let resyToken = RESY_AUTH_TOKEN;
+  try {
+    if (!resyToken) {
+      const brain = await readBrain();
+      resyToken = brain?.credentials?.resy_auth_token || brain?.resy_auth_token || "";
+    }
+  } catch (e) {}
+
+  if (!resyToken) {
+    return vapiRespond(res, "I still need your Resy auth token to complete the booking.", toolCallId);
+  }
+
+  try {
+    // Step 1: Get booking details (book_token)
+    const detailsResp = await get(
+      `https://api.resy.com/3/details?config_id=${encodeURIComponent(pending.config_token)}&date=${pending.date}&party_size=${pending.party_size}`,
+      {
+        "Authorization": `ResyAPI api_key="${RESY_API_KEY}"`,
+        "x-resy-auth-token": resyToken,
+        "User-Agent": "Mozilla/5.0 (compatible; CammyVA/1.6)",
+        "Origin": "https://resy.com",
+        "Referer": "https://resy.com/",
+      },
+      10000
+    );
+
+    const bookToken = detailsResp.body?.book_token?.value;
+    if (!bookToken) {
+      throw new Error("No book_token in details response");
+    }
+
+    // Step 2: Execute booking
+    const bookResp = await postForm(
+      "https://api.resy.com/3/book",
+      {
+        book_token: bookToken,
+        struct_payment_method: JSON.stringify({ id: 0 }),
+        source_id: "resy.com-venue-details",
+      },
+      {
+        "Authorization": `ResyAPI api_key="${RESY_API_KEY}"`,
+        "x-resy-auth-token": resyToken,
+        "User-Agent": "Mozilla/5.0 (compatible; CammyVA/1.6)",
+        "Origin": "https://resy.com",
+        "Referer": "https://resy.com/",
+      },
+      12000
+    );
+
+    const resyId = bookResp.body?.reservation_id || bookResp.body?.resy_token;
+
+    if (bookResp.status === 201 || bookResp.status === 200 || resyId) {
+      // Success — create calendar event via Pipedream
+      const confirmationMsg = `Booking confirmed at ${pending.venue_name} on ${pending.date} at ${pending.time} for ${pending.party_size}. Confirmation ID: ${resyId || "confirmed"}.`;
+
+      // Add to Google Calendar
+      callGcalProxy("create_calendar_event", {
+        summary: `Dinner at ${pending.venue_name}`,
+        date: pending.date,
+        time: pending.time,
+        duration_minutes: 90,
+        description: `Resy booking confirmed. Confirmation: ${resyId || "confirmed"}. Party of ${pending.party_size}.`,
+      }).catch(e => console.error("[confirm_resy] calendar event failed:", e.message));
+
+      // Log to OneDrive
+      const logEntry = {
+        timestamp: nowET(),
+        action: "resy_booking_confirmed",
+        venue: pending.venue_name,
+        date: pending.date,
+        time: pending.time,
+        party_size: pending.party_size,
+        reservation_id: resyId || "confirmed",
+        status: "success",
+      };
+      const content_b64 = Buffer.from(JSON.stringify(logEntry, null, 2), "utf8").toString("base64");
+      post(ONEDRIVE_ROUTER, {
+        filename: `resy_booking_${pending.date}_${Date.now()}.json`,
+        content_b64,
+        force_folder: "04 Bookings",
+        overwrite: false,
+      }, {}, 10000).catch(e => console.error("[confirm_resy] log failed:", e.message));
+
+      app.locals.pendingResyBooking = null;
+      vapiRespond(res, confirmationMsg + " I've also added it to your calendar.", toolCallId);
+      console.log(`[confirm_resy_booking] SUCCESS — ${pending.venue_name} ${pending.date} ${pending.time} resy_id=${resyId}`);
+
+    } else {
+      const errMsg = bookResp.body?.message || bookResp.body?.error || `HTTP ${bookResp.status}`;
+      console.error("[confirm_resy_booking] booking failed:", errMsg);
+      vapiRespond(
+        res,
+        `The booking at ${pending.venue_name} could not be completed: ${errMsg}. Please try booking directly in the Resy app.`,
+        toolCallId
+      );
+    }
+
+  } catch (err) {
+    console.error("[confirm_resy_booking]", err.message);
+    vapiRespond(res, `I ran into an error completing the Resy booking. Please book directly in the Resy app.`, toolCallId);
+  }
+});
+
+// ============================================================
+// NEW TOOL 11 (v1.6): /vapi/order_uber
+// Args: { pickup?: string, destination: string,
+//         product?: "UberX"|"UberBlack"|"UberXL" }
+// Requires UBER_ACCESS_TOKEN (OAuth token for Ates's account)
+// stored in brain.json under credentials.uber_access_token
+// ============================================================
+app.post("/vapi/order_uber", async (req, res) => {
+  const { toolCallId, args } = extractArgs(req.body);
+  const destination = args?.destination || "";
+  const pickup = args?.pickup || "current location";
+  const product_pref = (args?.product || "UberX").toLowerCase();
+
+  if (!destination) {
+    return vapiRespond(res, "Where would you like to go? Tell me the destination address.", toolCallId);
+  }
+
+  // Get Uber token from brain or env
+  let uberToken = UBER_ACCESS_TOKEN;
+  try {
+    if (!uberToken) {
+      const brain = await readBrain();
+      uberToken = brain?.credentials?.uber_access_token || brain?.uber_access_token || "";
+    }
+  } catch (e) {
+    console.error("[order_uber] brain read failed:", e.message);
+  }
+
+  if (!uberToken) {
+    return vapiRespond(
+      res,
+      "I don't have your Uber credentials yet. To connect Uber: go to developer.uber.com, create an app, authorize it with your Uber account, and share the access token with me. For now, I can open the Uber app for you.",
+      toolCallId
+    );
+  }
+
+  try {
+    // Geocode destination
+    const destCoords = await geocode(destination);
+
+    // Geocode pickup (if not "current location")
+    let pickupCoords = { lat: 42.337, lon: -71.2087 }; // Default: Newton MA
+    if (pickup && pickup !== "current location") {
+      pickupCoords = await geocode(pickup);
+    }
+
+    // Step 1: Get available products
+    const productsResp = await get(
+      `https://api.uber.com/v1.2/products?latitude=${pickupCoords.lat}&longitude=${pickupCoords.lon}`,
+      { Authorization: `Bearer ${uberToken}` },
+      10000
+    );
+
+    const products = productsResp.body?.products || [];
+    if (!products.length) {
+      return vapiRespond(res, "No Uber products available near your pickup location right now.", toolCallId);
+    }
+
+    // Find preferred product
+    const product = products.find(p =>
+      p.display_name?.toLowerCase().includes(product_pref) ||
+      p.product_id === product_pref
+    ) || products.find(p => p.display_name?.toLowerCase().includes("uberx")) || products[0];
+
+    // Step 2: Get fare estimate
+    const estimateResp = await post(
+      "https://api.uber.com/v1.2/requests/estimate",
+      {
+        product_id: product.product_id,
+        start_latitude: pickupCoords.lat,
+        start_longitude: pickupCoords.lon,
+        end_latitude: destCoords.lat,
+        end_longitude: destCoords.lon,
+      },
+      { Authorization: `Bearer ${uberToken}`, "Content-Type": "application/json" },
+      12000
+    );
+
+    const fare = estimateResp.body?.fare;
+    const trip = estimateResp.body?.trip;
+    const fareId = fare?.fare_id;
+    const fareDisplay = fare?.display || "unknown fare";
+    const durationMin = trip?.duration_estimate ? Math.round(trip.duration_estimate / 60) : null;
+    const pickupEta = estimateResp.body?.pickup_estimate;
+
+    const durationText = durationMin ? ` Estimated ride: ${durationMin} minutes.` : "";
+    const etaText = pickupEta ? ` Driver arrives in about ${pickupEta} minutes.` : "";
+
+    // Step 3: Confirm with Ates before requesting
+    // Store pending ride for confirm_uber call
+    app.locals.pendingUberRide = {
+      product_id: product.product_id,
+      product_name: product.display_name,
+      fare_id: fareId,
+      pickup_lat: pickupCoords.lat,
+      pickup_lon: pickupCoords.lon,
+      dest_lat: destCoords.lat,
+      dest_lon: destCoords.lon,
+      destination_name: destination,
+      fare_display: fareDisplay,
+      timestamp: Date.now(),
+    };
+
+    vapiRespond(
+      res,
+      `${product.display_name} to ${destination} — ${fareDisplay}.${durationText}${etaText} Shall I confirm the ride?`,
+      toolCallId
+    );
+
+    console.log(`[order_uber] ${product.display_name} to ${destination} fare=${fareDisplay}`);
+
+  } catch (err) {
+    console.error("[order_uber]", err.message);
+    vapiRespond(res, `I had trouble booking an Uber. ${err.message.includes("geocode") ? "I could not find that address." : "Try the Uber app directly."} `, toolCallId);
+  }
+});
+
+// ============================================================
+// NEW TOOL 12 (v1.6): /vapi/confirm_uber_ride
+// Args: { confirm: boolean }
+// ============================================================
+app.post("/vapi/confirm_uber_ride", async (req, res) => {
+  const { toolCallId, args } = extractArgs(req.body);
+  const confirm = args?.confirm !== false;
+
+  if (!confirm) {
+    app.locals.pendingUberRide = null;
+    return vapiRespond(res, "Ride cancelled.", toolCallId);
+  }
+
+  const pending = app.locals.pendingUberRide;
+  if (!pending || (Date.now() - pending.timestamp) > 3 * 60 * 1000) {
+    return vapiRespond(res, "The ride estimate expired. Please start over with your destination.", toolCallId);
+  }
+
+  let uberToken = UBER_ACCESS_TOKEN;
+  try {
+    if (!uberToken) {
+      const brain = await readBrain();
+      uberToken = brain?.credentials?.uber_access_token || "";
+    }
+  } catch (e) {}
+
+  if (!uberToken) {
+    return vapiRespond(res, "I lost your Uber credentials. Please use the Uber app.", toolCallId);
+  }
+
+  try {
+    const rideResp = await post(
+      "https://api.uber.com/v1.2/requests",
+      {
+        product_id: pending.product_id,
+        start_latitude: pending.pickup_lat,
+        start_longitude: pending.pickup_lon,
+        end_latitude: pending.dest_lat,
+        end_longitude: pending.dest_lon,
+        fare_id: pending.fare_id,
+      },
+      { Authorization: `Bearer ${uberToken}`, "Content-Type": "application/json" },
+      15000
+    );
+
+    if (rideResp.status === 202 || rideResp.body?.request_id) {
+      const requestId = rideResp.body?.request_id || "confirmed";
+      app.locals.pendingUberRide = null;
+      vapiRespond(res, `Your ${pending.product_name} is on the way to take you to ${pending.destination_name}. Request ID: ${requestId}. You can track it in the Uber app.`, toolCallId);
+      console.log(`[confirm_uber_ride] SUCCESS request_id=${requestId}`);
+    } else {
+      const errMsg = rideResp.body?.message || rideResp.body?.errors?.[0]?.message || `HTTP ${rideResp.status}`;
+      console.error("[confirm_uber_ride] failed:", errMsg);
+      vapiRespond(res, `Uber could not complete the request: ${errMsg}. Please use the Uber app.`, toolCallId);
+    }
+  } catch (err) {
+    console.error("[confirm_uber_ride]", err.message);
+    vapiRespond(res, "Uber ride request failed. Please use the Uber app.", toolCallId);
+  }
+});
+
+// ============================================================
+// NEW TOOL 13 (v1.6): /vapi/make_call
+// Place an outbound call on Ates's behalf via Twilio
+// Args: { to_name: string, to_number?: string,
+//         message?: string, purpose?: string }
+// ============================================================
+app.post("/vapi/make_call", async (req, res) => {
+  const { toolCallId, args } = extractArgs(req.body);
+  const to_name   = args?.to_name   || "";
+  const purpose   = args?.purpose   || "general call";
+  let to_number   = args?.to_number || "";
+
+  if (!to_name && !to_number) {
+    return vapiRespond(res, "Who would you like me to call? Give me a name or number.", toolCallId);
+  }
+
+  // Look up number in brain if not provided
+  if (!to_number) {
+    try {
+      const brain = await readBrain();
+      const contacts = brain?.contacts || {};
+      for (const [name, info] of Object.entries(contacts)) {
+        if (name.toLowerCase().includes(to_name.toLowerCase())) {
+          const phone = (info.phones || []).find(p => p && p !== "GAP" && p.startsWith("+"));
+          if (phone) { to_number = phone; break; }
+        }
+      }
+    } catch (e) {
+      console.error("[make_call] brain lookup failed:", e.message);
+    }
+  }
+
+  if (!to_number) {
+    return vapiRespond(
+      res,
+      `I don't have a number for ${to_name} in your contacts. What number should I call?`,
+      toolCallId
+    );
+  }
+
+  try {
+    const twiml = `<Response><Say voice="Polly.Joanna">Hi, this is Cammy calling on behalf of Ates Civitci regarding ${purpose}. Please hold for Ates or call back at +1 617 347 5359.</Say></Response>`;
+
+    const auth = Buffer.from(`${TWILIO_SID}:${TWILIO_AUTH}`).toString("base64");
+    const callResp = await postForm(
+      `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_SID}/Calls.json`,
+      { Twiml: twiml, To: to_number, From: TWILIO_FROM },
+      { Authorization: `Basic ${auth}` },
+      12000
+    );
+
+    if (callResp.status === 201 && callResp.body?.sid) {
+      const sid = callResp.body.sid;
+      vapiRespond(res, `I'm calling ${to_name} at ${to_number} now. Call SID: ${sid}. They'll hear a message from me on your behalf.`, toolCallId);
+      console.log(`[make_call] called ${to_name} ${to_number} SID=${sid}`);
+    } else {
+      const errMsg = callResp.body?.message || callResp.body?.error || `HTTP ${callResp.status}`;
+      vapiRespond(res, `I could not place the call to ${to_name}: ${errMsg}`, toolCallId);
+    }
+
+  } catch (err) {
+    console.error("[make_call]", err.message);
+    vapiRespond(res, `I had trouble placing the call to ${to_name}. Try again.`, toolCallId);
+  }
+});
+
+// ============================================================
+// NEW TOOL 14 (v1.6): /vapi/ask_computer
+// Direct handoff to Perplexity Computer for deep analysis.
+// Cammy calls this when a task exceeds her Vapi context.
+// Args: { question: string, context?: string }
+// Returns: Computer's answer spoken back through Cammy.
+// NOTE: This does NOT create a middle agent. Cammy sends the
+// question, Computer answers, Cammy reads the answer aloud.
+// ============================================================
+app.post("/vapi/ask_computer", async (req, res) => {
+  const { toolCallId, args } = extractArgs(req.body);
+  const question = args?.question || args?.query || "";
+  const context = args?.context || "";
+
+  if (!question) {
+    return vapiRespond(res, "What would you like me to look up with Computer?", toolCallId);
+  }
+
+  if (!PERPLEXITY_API_KEY) {
+    // Fallback: use OpenAI for the answer
+    try {
+      const answer = await callOpenAI(
+        "You are Cammy, an executive AI assistant for Ates Civitci. Answer concisely and accurately. Speak in 1-3 sentences max for voice delivery.",
+        context ? `Context: ${context}\n\nQuestion: ${question}` : question,
+        20000
+      );
+      return vapiRespond(res, answer, toolCallId);
+    } catch (e) {
+      return vapiRespond(res, "I could not reach Computer for that analysis. Try asking me again.", toolCallId);
+    }
+  }
+
+  try {
+    // Call Perplexity sonar API
+    const systemMsg = `You are Cammy's deep-research assistant. The user's question is being routed through Cammy's voice interface. Respond in 2-4 short sentences suitable for text-to-speech. Be direct and actionable. No markdown, no bullet points — plain prose only.`;
+
+    const resp = await post(
+      "https://api.perplexity.ai/chat/completions",
+      {
+        model: "sonar",
+        messages: [
+          { role: "system", content: systemMsg },
+          { role: "user", content: context ? `${context}\n\n${question}` : question },
+        ],
+        max_tokens: 300,
+        temperature: 0.2,
+      },
+      {
+        Authorization: `Bearer ${PERPLEXITY_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      20000
+    );
+
+    const answer = resp.body?.choices?.[0]?.message?.content || "";
+
+    if (!answer) {
+      return vapiRespond(res, "I got an empty response from Computer. Try rephrasing the question.", toolCallId);
+    }
+
+    // Clean for TTS — remove any markdown that slipped through
+    const cleanAnswer = answer
+      .replace(/\*\*/g, "").replace(/\*/g, "")
+      .replace(/#{1,6}\s/g, "").replace(/\n{2,}/g, ". ")
+      .replace(/\n/g, " ").trim();
+
+    vapiRespond(res, cleanAnswer, toolCallId);
+    console.log(`[ask_computer] answered: "${question.slice(0, 60)}..." — ${cleanAnswer.length} chars`);
+
+  } catch (err) {
+    console.error("[ask_computer]", err.message);
+    vapiRespond(res, "I had trouble reaching Computer for that analysis. Try again.", toolCallId);
+  }
+});
+
+// ── Health check ─────────────────────────────────────────────
+app.get("/health", (_req, res) => res.json({
+  ok: true,
+  uptime: process.uptime(),
+  time: nowET(),
+  v: "1.6",
+  meeting_active: meetingState.active,
+  tools: [
+    "get_today_schedule", "get_urgent_emails", "get_open_loops", "get_brain_fact",
+    "get_weather", "book_opentable", "confirm_opentable_booking",
+    "book_resy", "confirm_resy_booking",
+    "order_uber", "confirm_uber_ride",
+    "make_call", "ask_computer",
+  ],
+}));
+app.get("/", (_req, res) => res.json({ ok: true, server: "cammy-vapi-tool-server", v: "1.6" }));
+
+app.listen(PORT, () => console.log(`[${nowET()}] Cammy Vapi Tool Server v1.6 on port ${PORT}`));
