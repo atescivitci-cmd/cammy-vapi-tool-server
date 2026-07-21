@@ -1,8 +1,11 @@
 // ============================================================
-// Cammy Vapi Tool Server v1.6
+// Cammy Vapi Tool Server v1.7
 // Handles tool calls from Vapi during voice calls.
 //
-// NEW in v1.6:
+// NEW in v1.7:
+//   POST /vapi/view_instagram_video — describe the video on an Instagram post
+//
+// v1.6:
 //   POST /vapi/book_opentable   — OpenTable availability + browser booking
 //   POST /vapi/book_resy        — Resy availability + booking (unofficial API)
 //   POST /vapi/get_weather      — Weather via wttr.in (no API key needed)
@@ -49,6 +52,9 @@ const PERPLEXITY_API_KEY  = process.env.PERPLEXITY_API_KEY || "";
 const UBER_ACCESS_TOKEN   = process.env.UBER_ACCESS_TOKEN || "";
 const RESY_API_KEY        = process.env.RESY_API_KEY      || "VbWk7s3L4KiK5fzlO7JD3Q5ZYj2LcbzTIUz0hqs185M=";
 const RESY_AUTH_TOKEN     = process.env.RESY_AUTH_TOKEN   || ""; // Per-user auth token from brain.json
+// NEW v1.7 — Instagram video viewing
+const INSTAGRAM_RESOLVER_URL = process.env.INSTAGRAM_RESOLVER_URL || ""; // Proxy (Pipedream/RapidAPI) that returns {video_url, thumbnail_url, caption, author} for a post URL
+const INSTAGRAM_OEMBED_TOKEN = process.env.INSTAGRAM_OEMBED_TOKEN || ""; // Facebook app token for graph.facebook.com instagram_oembed (fallback)
 
 // ── Helper: HTTP/S GET with timeout ─────────────────────────
 function get(url, headers = {}, timeoutMs = 9000) {
@@ -1533,21 +1539,166 @@ app.post("/vapi/ask_computer", async (req, res) => {
   }
 });
 
+// ============================================================
+// NEW TOOL 15 (v1.7): /vapi/view_instagram_video
+// Lets Cammy "look at" the video on an Instagram post and
+// describe it out loud during a call.
+// Args: { url: string }  (accepts a full post/reel link or a bare shortcode)
+// Returns: a 2-3 sentence spoken description of the video.
+//
+// Media is resolved via INSTAGRAM_RESOLVER_URL (a Pipedream/RapidAPI
+// proxy that returns {video_url, thumbnail_url, caption, author}) or,
+// as a fallback, Facebook's instagram_oembed read endpoint using
+// INSTAGRAM_OEMBED_TOKEN. Since a synchronous voice call can't ingest
+// a whole video, Cammy describes it from the thumbnail + caption via
+// GPT-4o-mini vision.
+// ============================================================
+
+// ── Helper: pull the shortcode out of an Instagram link ──────
+function instagramShortcode(input) {
+  if (!input) return null;
+  const m = String(input).match(/instagram\.com\/(?:reels?|p|tv)\/([A-Za-z0-9_-]+)/i);
+  if (m) return m[1];
+  const bare = String(input).trim().match(/^([A-Za-z0-9_-]{5,})$/);
+  return bare ? bare[1] : null;
+}
+
+// ── Helper: canonicalize to a post URL Instagram/oEmbed accepts ──
+function normalizeInstagramUrl(input) {
+  // A full instagram.com link passes through unchanged (keeps /p/ vs /reel/).
+  if (/^https?:\/\/[^ ]*instagram\.com\//i.test(String(input))) return String(input).trim();
+  // A bare shortcode gets turned into a canonical reel URL.
+  const code = instagramShortcode(input);
+  if (code) return `https://www.instagram.com/reel/${code}/`;
+  return null;
+}
+
+// ── Helper: resolve a post URL to its media (caption/thumbnail/video) ──
+async function resolveInstagramMedia(url) {
+  // 1) Preferred: a custom resolver proxy (handles Instagram's auth/scraping).
+  if (INSTAGRAM_RESOLVER_URL) {
+    const resp = await post(INSTAGRAM_RESOLVER_URL, { url }, {}, 15000);
+    const b = resp.body || {};
+    const media = b.data || b.result || b; // accept a few common wrapper shapes
+    const caption = media.caption ?? media.title ?? media.text ?? "";
+    const thumbnail_url = media.thumbnail_url || media.thumbnail || media.display_url || media.image_url || "";
+    const video_url = media.video_url || media.video || media.download_url || "";
+    const author = media.author_name || media.author || media.username || media.owner || "";
+    if (caption || thumbnail_url || video_url) {
+      return { caption, thumbnail_url, video_url, author, source: "resolver" };
+    }
+    throw new Error("resolver returned no media");
+  }
+  // 2) Fallback: Facebook oEmbed read (caption + thumbnail only, needs app token).
+  if (INSTAGRAM_OEMBED_TOKEN) {
+    const api = `https://graph.facebook.com/v19.0/instagram_oembed?omitscript=true&url=${encodeURIComponent(url)}&access_token=${encodeURIComponent(INSTAGRAM_OEMBED_TOKEN)}`;
+    const resp = await get(api, {}, 12000);
+    const b = resp.body || {};
+    if (b.error) throw new Error(b.error.message || "oEmbed error");
+    return { caption: b.title || "", thumbnail_url: b.thumbnail_url || "", video_url: "", author: b.author_name || "", source: "oembed" };
+  }
+  throw new Error("NOT_CONFIGURED");
+}
+
+// ── Helper: describe a thumbnail + caption via GPT-4o-mini vision ──
+async function describeInstagramMedia(thumbnailUrl, caption, author) {
+  if (!OPENAI_API_KEY) return null;
+  const promptText =
+    `This is an Instagram video post${author ? ` by ${author}` : ""}.` +
+    (caption ? ` Caption: "${caption}".` : "") +
+    ` Describe what the video most likely shows, based on the thumbnail and caption, in 2-3 short sentences suitable for text-to-speech. Plain prose only, no markdown.`;
+  const userContent = [{ type: "text", text: promptText }];
+  if (thumbnailUrl) userContent.push({ type: "image_url", image_url: { url: thumbnailUrl } });
+
+  const resp = await post(
+    "https://api.openai.com/v1/chat/completions",
+    {
+      model: "gpt-4o-mini",
+      messages: [
+        { role: "system", content: "You are Cammy, an executive AI assistant. Describe media concisely for spoken delivery." },
+        { role: "user", content: userContent },
+      ],
+      temperature: 0.3,
+      max_tokens: 250,
+    },
+    { Authorization: `Bearer ${OPENAI_API_KEY}` },
+    30000
+  );
+  if (resp.body?.error) throw new Error(resp.body.error.message || JSON.stringify(resp.body.error));
+  return resp.body?.choices?.[0]?.message?.content?.trim() || null;
+}
+
+app.post("/vapi/view_instagram_video", async (req, res) => {
+  const { toolCallId, args } = extractArgs(req.body);
+  const rawUrl = args?.url || args?.link || args?.post_url || args?.video_url || "";
+
+  if (!rawUrl) {
+    return vapiRespond(res, "Which Instagram post? Send me the link and I'll take a look.", toolCallId);
+  }
+
+  const url = normalizeInstagramUrl(rawUrl);
+  if (!url) {
+    return vapiRespond(res, "That doesn't look like an Instagram post link. Send me a URL like instagram.com/reel/…", toolCallId);
+  }
+
+  try {
+    const media = await resolveInstagramMedia(url);
+
+    let spoken = "";
+    try {
+      const desc = await describeInstagramMedia(media.thumbnail_url, media.caption, media.author);
+      if (desc) spoken = desc;
+    } catch (e) {
+      console.error("[view_instagram_video] vision:", e.message);
+    }
+
+    if (!spoken) {
+      // No vision available — fall back to caption/author.
+      if (media.caption) {
+        spoken = `${media.author ? `It's a post by ${media.author}. ` : ""}The caption reads: ${media.caption}`;
+      } else if (media.author) {
+        spoken = `It's an Instagram video by ${media.author}, but there's no caption I can read out.`;
+      } else {
+        spoken = "I found the post but couldn't pull any details to describe it.";
+      }
+    }
+
+    const cleaned = spoken
+      .replace(/\*\*/g, "").replace(/\*/g, "")
+      .replace(/#{1,6}\s/g, "").replace(/\n{2,}/g, ". ")
+      .replace(/\n/g, " ").trim();
+
+    vapiRespond(res, cleaned, toolCallId);
+    console.log(`[view_instagram_video] ${url} via ${media.source} — ${cleaned.length} chars`);
+
+  } catch (err) {
+    if (err.message === "NOT_CONFIGURED") {
+      return vapiRespond(
+        res,
+        "I can't open Instagram videos yet — that tool isn't connected on my end. Ates needs to set up the Instagram resolver first.",
+        toolCallId
+      );
+    }
+    console.error("[view_instagram_video]", err.message);
+    vapiRespond(res, "I had trouble opening that Instagram video. Make sure the post is public and try again.", toolCallId);
+  }
+});
+
 // ── Health check ─────────────────────────────────────────────
 app.get("/health", (_req, res) => res.json({
   ok: true,
   uptime: process.uptime(),
   time: nowET(),
-  v: "1.6",
+  v: "1.7",
   meeting_active: meetingState.active,
   tools: [
     "get_today_schedule", "get_urgent_emails", "get_open_loops", "get_brain_fact",
     "get_weather", "book_opentable", "confirm_opentable_booking",
     "book_resy", "confirm_resy_booking",
     "order_uber", "confirm_uber_ride",
-    "make_call", "ask_computer",
+    "make_call", "ask_computer", "view_instagram_video",
   ],
 }));
-app.get("/", (_req, res) => res.json({ ok: true, server: "cammy-vapi-tool-server", v: "1.6" }));
+app.get("/", (_req, res) => res.json({ ok: true, server: "cammy-vapi-tool-server", v: "1.7" }));
 
-app.listen(PORT, () => console.log(`[${nowET()}] Cammy Vapi Tool Server v1.6 on port ${PORT}`));
+app.listen(PORT, () => console.log(`[${nowET()}] Cammy Vapi Tool Server v1.7 on port ${PORT}`));
