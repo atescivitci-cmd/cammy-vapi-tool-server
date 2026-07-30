@@ -25,6 +25,13 @@ import express from "express";
 import https from "https";
 import http from "http";
 
+
+// PHASE 0.1: per-call state. Replaces the module-level meetingState singleton and
+// the app.locals pending-booking singletons, both of which were last-writer-wins
+// across concurrent calls.
+import { CallState, SlotConflictError } from "./call_state.mjs";
+const callState = new CallState();
+
 const app = express();
 app.use(express.json());
 
@@ -387,12 +394,10 @@ app.post("/onedrive/move", async (req, res) => {
 // ============================================================
 // MEETING LISTEN MODE (v1.4)
 // ============================================================
-let meetingState = {
-  active: false,
-  startTime: null,
-  title: "Untitled Meeting",
-  attendees: [],
-};
+// PHASE 0.1: the module-level meetingState singleton is gone. It was shared by every
+// concurrent call - two meetings at once and the second overwrote the first, so the
+// first caller's /meeting/end summarised the wrong meeting. State is now per-call in
+// callState, keyed by CallState.keyFrom(req.body).
 
 // ============================================================
 // ENDPOINT: POST /meeting/start
@@ -402,12 +407,25 @@ app.post("/meeting/start", async (req, res) => {
   const title = args?.title || req.body?.title || "Untitled Meeting";
   const attendees = args?.attendees || req.body?.attendees || [];
 
-  meetingState = {
-    active: true,
-    startTime: Date.now(),
-    title,
-    attendees: Array.isArray(attendees) ? attendees : [attendees],
-  };
+  // PHASE 0.1: keyed per call instead of one shared object
+  const callKey = CallState.keyFrom(req.body);
+  const attendeeList0 = Array.isArray(attendees) ? attendees : [attendees];
+  try {
+    callState.put(callKey, "meeting", {
+      active: true,
+      startTime: Date.now(),
+      title,
+      attendees: attendeeList0,
+    });
+  } catch (e) {
+    if (e instanceof SlotConflictError) {
+      return vapiRespond(res,
+        `There is already a meeting running for this call: "${callState.get(callKey, "meeting")?.title}".`,
+        toolCallId);
+    }
+    throw e;
+  }
+  const meetingState = callState.get(callKey, "meeting");
 
   const timeStr = new Date().toLocaleTimeString("en-US", { timeZone: "America/New_York", hour: "numeric", minute: "2-digit" });
   const attendeeStr = meetingState.attendees.length > 0
@@ -430,6 +448,13 @@ app.post("/meeting/start", async (req, res) => {
 app.post("/meeting/end", async (req, res) => {
   const { toolCallId, args } = extractArgs(req.body);
 
+  // PHASE 0.1 + H4: no meeting for this call means say so, not summarise default state.
+  const callKey = CallState.keyFrom(req.body);
+  const meetingState = callState.get(callKey, "meeting");
+  if (!meetingState) {
+    return vapiRespond(res, "I do not have a meeting running to wrap up.", toolCallId);
+  }
+
   const title = args?.title || req.body?.title || meetingState.title || "Untitled Meeting";
   const attendees = args?.attendees || req.body?.attendees || meetingState.attendees || [];
   const notes = args?.notes || req.body?.notes || "";
@@ -448,7 +473,7 @@ app.post("/meeting/end", async (req, res) => {
   const dateISO = todayISOET();
   const attendeeList = Array.isArray(attendees) ? attendees : [attendees];
 
-  meetingState = { active: false, startTime: null, title: "Untitled Meeting", attendees: [] };
+  callState.clear(callKey, "meeting");   // PHASE 0.1
 
   let markdownSummary = "";
   let spokenSummary = "";
@@ -1074,7 +1099,7 @@ app.post("/vapi/book_resy", async (req, res) => {
 
     // Store config_id temporarily in memory for follow-up confirm call
     // (in-memory, short-lived — enough for the current Vapi call)
-    app.locals.pendingResyBooking = {
+    callState.put(CallState.keyFrom(req.body), "resy_booking", {   // PHASE 0.1
       config_token: configId,
       venue_name,
       venue_id,
@@ -1082,7 +1107,7 @@ app.post("/vapi/book_resy", async (req, res) => {
       time: slotTime,
       party_size,
       timestamp: Date.now(),
-    };
+    });
 
     console.log(`[book_resy] ${venue_name} ${date} — slot ${slotTime}, config ${configId}`);
 
@@ -1102,11 +1127,14 @@ app.post("/vapi/confirm_resy_booking", async (req, res) => {
   const confirm = args?.confirm !== false; // default true
 
   if (!confirm) {
-    app.locals.pendingResyBooking = null;
+    callState.clear(CallState.keyFrom(req.body), "resy_booking");   // PHASE 0.1
     return vapiRespond(res, "Booking cancelled. Let me know if you want to try a different time.", toolCallId);
   }
 
-  const pending = app.locals.pendingResyBooking;
+  const pending = callState.get(CallState.keyFrom(req.body), "resy_booking");   // PHASE 0.1
+  if (!pending) {
+    return vapiRespond(res, "That booking request expired. Want me to search again?", toolCallId);
+  }
   if (!pending || (Date.now() - pending.timestamp) > 5 * 60 * 1000) {
     return vapiRespond(res, "The booking session expired. Please start over with the restaurant name.", toolCallId);
   }
@@ -1194,7 +1222,7 @@ app.post("/vapi/confirm_resy_booking", async (req, res) => {
         overwrite: false,
       }, {}, 10000).catch(e => console.error("[confirm_resy] log failed:", e.message));
 
-      app.locals.pendingResyBooking = null;
+      callState.clear(CallState.keyFrom(req.body), "resy_booking");   // PHASE 0.1
       vapiRespond(res, confirmationMsg + " I've also added it to your calendar.", toolCallId);
       console.log(`[confirm_resy_booking] SUCCESS — ${pending.venue_name} ${pending.date} ${pending.time} resy_id=${resyId}`);
 
@@ -1539,7 +1567,7 @@ app.get("/health", (_req, res) => res.json({
   uptime: process.uptime(),
   time: nowET(),
   v: "1.6",
-  meeting_active: meetingState.active,
+  state: callState.stats(),   // PHASE 0.1: per-call, not one global boolean
   tools: [
     "get_today_schedule", "get_urgent_emails", "get_open_loops", "get_brain_fact",
     "get_weather", "book_opentable", "confirm_opentable_booking",
