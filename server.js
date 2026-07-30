@@ -30,6 +30,30 @@ import http from "http";
 // the app.locals pending-booking singletons, both of which were last-writer-wins
 // across concurrent calls.
 import { CallState, SlotConflictError } from "./call_state.mjs";
+
+// PHASE 0.4: durable failure sink. Before this, every failure in /call-complete was a
+// console.error and nothing more - a failed OneDrive save or memory write silently lost the
+// whole call. Render's disk is ephemeral, but a file that survives the request is still the
+// difference between "recoverable" and "gone", and it makes the failure countable.
+import { appendFileSync, mkdirSync } from "node:fs";
+const DEAD_LETTER = process.env.DEAD_LETTER_PATH || "/tmp/cammy-dead-letter.jsonl";
+function recordFailure(stage, detail, payload) {
+  const row = {
+    ts: new Date().toISOString(),
+    stage,
+    detail: typeof detail === "string" ? detail : (detail?.message || String(detail)),
+    payload: payload === undefined ? null : payload,
+  };
+  try {
+    mkdirSync(DEAD_LETTER.replace(/\/[^/]+$/, ""), { recursive: true });
+    appendFileSync(DEAD_LETTER, JSON.stringify(row) + "\n");
+  } catch (e) {
+    console.error("[dead-letter] could not persist:", e.message);
+  }
+  console.error(`[FAILED:${stage}] ${row.detail}`);
+  return row;
+}
+
 const callState = new CallState();
 
 const app = express();
@@ -646,7 +670,7 @@ Rules:
     extracted = JSON.parse(cleaned);
     console.log(`[call-complete] extraction OK — tasks:${extracted.tasks?.length} commitments:${extracted.commitments?.length} decisions:${extracted.decisions?.length} facts:${extracted.memory_facts?.length}`);
   } catch (err) {
-    console.error("[call-complete] GPT extraction failed:", err.message);
+    recordFailure("call-complete.extraction", err);   // PHASE 0.4
     extracted = { summary: "GPT extraction failed", tasks: [], commitments: [], decisions: [], new_contacts: [], memory_facts: [], follow_ups: [] };
   }
 
@@ -662,7 +686,7 @@ Rules:
     }, {}, 20000);
     console.log(`[call-complete] call log saved`);
   } catch (err) {
-    console.error("[call-complete] OneDrive log save failed:", err.message);
+    recordFailure("call-complete.onedrive_log", err);   // PHASE 0.4
   }
 
   try {
@@ -696,7 +720,22 @@ Rules:
       })),
     ];
 
+    
+    if (allItems.length && !MEMORY_WRITE_URL) {
+
+      recordFailure("call-complete.memory_write_url_skipped",
+
+        "MEMORY_WRITE_URL is unset - ${allItems.length} item(s) were NOT written and are lost unless replayed",
+
+        { count: allItems.length });
+
+    }
+
     if (allItems.length && MEMORY_WRITE_URL) {
+
+      // PHASE 0.4b: recorded, not skipped in silence.
+      // PHASE 0.4: an unset MEMORY_WRITE_URL used to skip this write with no trace at all.
+      // The call's items never reached memory and nothing said so.
       await post(MEMORY_WRITE_URL, {
         action: "decision_log_append",
         items: allItems,
@@ -706,18 +745,33 @@ Rules:
       console.log(`[call-complete] decision log appended — ${allItems.length} rows`);
     }
   } catch (err) {
-    console.error("[call-complete] decision log append failed:", err.message);
+    recordFailure("call-complete.decision_log", err);   // PHASE 0.4
   }
 
   try {
     const facts = extracted.memory_facts || [];
     const contacts = extracted.new_contacts || [];
     const contactFacts = contacts.map(c =>
-      `Remember that Ates knows ${c.name} who is ${c.role}. Context: ${c.notes}`
+      `Remember that Ates
+      // PHASE 0.4: an unset MEMORY_WRITE_URL used to skip this write with no trace at all.
+      // The call's facts never reached memory and nothing said so. knows ${c.name} who is ${c.role}. Context: ${c.notes}`
     );
     const allFacts = [...facts, ...contactFacts];
 
+    
+    if (allFacts.length && !MEMORY_WRITE_URL) {
+
+      recordFailure("call-complete.memory_write_url_skipped",
+
+        "MEMORY_WRITE_URL is unset - ${allItems.length} item(s) were NOT written and are lost unless replayed",
+
+        { count: allFacts.length });
+
+    }
+
     if (allFacts.length && MEMORY_WRITE_URL) {
+
+      // PHASE 0.4b: recorded, not skipped in silence.
       await post(MEMORY_WRITE_URL, {
         action: "memory_update",
         facts: allFacts,
@@ -967,16 +1021,30 @@ app.post("/vapi/confirm_opentable_booking", async (req, res) => {
       deep_link: deepLink,
     };
     const content_b64 = Buffer.from(JSON.stringify(logEntry, null, 2), "utf8").toString("base64");
-    post(ONEDRIVE_ROUTER, {
-      filename: `booking_${date}_${Date.now()}.json`,
-      content_b64,
-      force_folder: "04 Bookings",
-      overwrite: false,
-    }, {}, 10000).catch(e => console.error("[confirm_opentable] log failed:", e.message));
+    // PHASE 0.2 (H4): await the log and tell the truth about it. This used to be
+    // fire-and-forget with the reply already claiming "I've logged" - when the router was
+    // down Ates was told it was logged and it was not.
+    let logged = false;
+    try {
+      await post(ONEDRIVE_ROUTER, {
+        filename: `booking_${date}_${Date.now()}.json`,
+        content_b64,
+        force_folder: "04 Bookings",
+        overwrite: false,
+      }, {}, 10000);
+      logged = true;
+    } catch (e) {
+      recordFailure("confirm_opentable.log", e, { date, slot_time, restaurant_name });
+    }
 
+    const who = restaurant_name || "the restaurant";
+    // Nothing is booked by this endpoint either way - it produces a deep link. Say that
+    // plainly rather than implying a reservation exists.
     vapiRespond(
       res,
-      `I've logged the booking request for ${restaurant_name || "the restaurant"} on ${date} at ${slot_time} for ${party_size || 2}. To complete it, open this link: ${deepLink}. I'll add a calendar reminder once you confirm.`,
+      logged
+        ? `Noted - ${who} on ${date} at ${slot_time} for ${party_size || 2}. It is not booked yet: open this link to finish it: ${deepLink}. I'll add the calendar reminder once you confirm.`
+        : `I could not save the note for ${who} on ${date} at ${slot_time}, so do not rely on me remembering it. It is not booked either - open this link to do it: ${deepLink}.`,
       toolCallId
     );
 
@@ -1577,5 +1645,15 @@ app.get("/health", (_req, res) => res.json({
   ],
 }));
 app.get("/", (_req, res) => res.json({ ok: true, server: "cammy-vapi-tool-server", v: "1.6" }));
+
+
+// PHASE 0.4: a missing MEMORY_WRITE_URL silently disabled the memory write for every call.
+// Configuration holes must announce themselves, not present as working software.
+for (const [k, why] of [
+  ["MEMORY_WRITE_URL", "call transcripts, tasks and facts will NOT reach memory"],
+  ["ONEDRIVE_ROUTER", "call logs and booking notes will NOT be saved"],
+]) {
+  if (!process.env[k]) console.error(`[CONFIG MISSING] ${k} is unset - ${why}`);
+}
 
 app.listen(PORT, () => console.log(`[${nowET()}] Cammy Vapi Tool Server v1.6 on port ${PORT}`));
