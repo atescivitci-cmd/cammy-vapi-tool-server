@@ -28,6 +28,37 @@ import express from "express";
 import https from "https";
 import http from "http";
 
+
+// PHASE 0.1: per-call state. Replaces the module-level meetingState singleton and
+// the app.locals pending-booking singletons, both of which were last-writer-wins
+// across concurrent calls.
+import { CallState, SlotConflictError } from "./call_state.mjs";
+
+// PHASE 0.4: durable failure sink. Before this, every failure in /call-complete was a
+// console.error and nothing more - a failed OneDrive save or memory write silently lost the
+// whole call. Render's disk is ephemeral, but a file that survives the request is still the
+// difference between "recoverable" and "gone", and it makes the failure countable.
+import { appendFileSync, mkdirSync } from "node:fs";
+const DEAD_LETTER = process.env.DEAD_LETTER_PATH || "/tmp/cammy-dead-letter.jsonl";
+function recordFailure(stage, detail, payload) {
+  const row = {
+    ts: new Date().toISOString(),
+    stage,
+    detail: typeof detail === "string" ? detail : (detail?.message || String(detail)),
+    payload: payload === undefined ? null : payload,
+  };
+  try {
+    mkdirSync(DEAD_LETTER.replace(/\/[^/]+$/, ""), { recursive: true });
+    appendFileSync(DEAD_LETTER, JSON.stringify(row) + "\n");
+  } catch (e) {
+    console.error("[dead-letter] could not persist:", e.message);
+  }
+  console.error(`[FAILED:${stage}] ${row.detail}`);
+  return row;
+}
+
+const callState = new CallState();
+
 const app = express();
 app.use(express.json());
 
@@ -393,12 +424,10 @@ app.post("/onedrive/move", async (req, res) => {
 // ============================================================
 // MEETING LISTEN MODE (v1.4)
 // ============================================================
-let meetingState = {
-  active: false,
-  startTime: null,
-  title: "Untitled Meeting",
-  attendees: [],
-};
+// PHASE 0.1: the module-level meetingState singleton is gone. It was shared by every
+// concurrent call - two meetings at once and the second overwrote the first, so the
+// first caller's /meeting/end summarised the wrong meeting. State is now per-call in
+// callState, keyed by CallState.keyFrom(req.body).
 
 // ============================================================
 // ENDPOINT: POST /meeting/start
@@ -408,12 +437,25 @@ app.post("/meeting/start", async (req, res) => {
   const title = args?.title || req.body?.title || "Untitled Meeting";
   const attendees = args?.attendees || req.body?.attendees || [];
 
-  meetingState = {
-    active: true,
-    startTime: Date.now(),
-    title,
-    attendees: Array.isArray(attendees) ? attendees : [attendees],
-  };
+  // PHASE 0.1: keyed per call instead of one shared object
+  const callKey = CallState.keyFrom(req.body);
+  const attendeeList0 = Array.isArray(attendees) ? attendees : [attendees];
+  try {
+    callState.put(callKey, "meeting", {
+      active: true,
+      startTime: Date.now(),
+      title,
+      attendees: attendeeList0,
+    });
+  } catch (e) {
+    if (e instanceof SlotConflictError) {
+      return vapiRespond(res,
+        `There is already a meeting running for this call: "${callState.get(callKey, "meeting")?.title}".`,
+        toolCallId);
+    }
+    throw e;
+  }
+  const meetingState = callState.get(callKey, "meeting");
 
   const timeStr = new Date().toLocaleTimeString("en-US", { timeZone: "America/New_York", hour: "numeric", minute: "2-digit" });
   const attendeeStr = meetingState.attendees.length > 0
@@ -436,6 +478,13 @@ app.post("/meeting/start", async (req, res) => {
 app.post("/meeting/end", async (req, res) => {
   const { toolCallId, args } = extractArgs(req.body);
 
+  // PHASE 0.1 + H4: no meeting for this call means say so, not summarise default state.
+  const callKey = CallState.keyFrom(req.body);
+  const meetingState = callState.get(callKey, "meeting");
+  if (!meetingState) {
+    return vapiRespond(res, "I do not have a meeting running to wrap up.", toolCallId);
+  }
+
   const title = args?.title || req.body?.title || meetingState.title || "Untitled Meeting";
   const attendees = args?.attendees || req.body?.attendees || meetingState.attendees || [];
   const notes = args?.notes || req.body?.notes || "";
@@ -454,7 +503,7 @@ app.post("/meeting/end", async (req, res) => {
   const dateISO = todayISOET();
   const attendeeList = Array.isArray(attendees) ? attendees : [attendees];
 
-  meetingState = { active: false, startTime: null, title: "Untitled Meeting", attendees: [] };
+  callState.clear(callKey, "meeting");   // PHASE 0.1
 
   let markdownSummary = "";
   let spokenSummary = "";
@@ -627,7 +676,7 @@ Rules:
     extracted = JSON.parse(cleaned);
     console.log(`[call-complete] extraction OK — tasks:${extracted.tasks?.length} commitments:${extracted.commitments?.length} decisions:${extracted.decisions?.length} facts:${extracted.memory_facts?.length}`);
   } catch (err) {
-    console.error("[call-complete] GPT extraction failed:", err.message);
+    recordFailure("call-complete.extraction", err);   // PHASE 0.4
     extracted = { summary: "GPT extraction failed", tasks: [], commitments: [], decisions: [], new_contacts: [], memory_facts: [], follow_ups: [] };
   }
 
@@ -643,7 +692,7 @@ Rules:
     }, {}, 20000);
     console.log(`[call-complete] call log saved`);
   } catch (err) {
-    console.error("[call-complete] OneDrive log save failed:", err.message);
+    recordFailure("call-complete.onedrive_log", err);   // PHASE 0.4
   }
 
   try {
@@ -677,7 +726,22 @@ Rules:
       })),
     ];
 
+    
+    if (allItems.length && !MEMORY_WRITE_URL) {
+
+      recordFailure("call-complete.memory_write_url_skipped",
+
+        "MEMORY_WRITE_URL is unset - ${allItems.length} item(s) were NOT written and are lost unless replayed",
+
+        { count: allItems.length });
+
+    }
+
     if (allItems.length && MEMORY_WRITE_URL) {
+
+      // PHASE 0.4b: recorded, not skipped in silence.
+      // PHASE 0.4: an unset MEMORY_WRITE_URL used to skip this write with no trace at all.
+      // The call's items never reached memory and nothing said so.
       await post(MEMORY_WRITE_URL, {
         action: "decision_log_append",
         items: allItems,
@@ -687,18 +751,33 @@ Rules:
       console.log(`[call-complete] decision log appended — ${allItems.length} rows`);
     }
   } catch (err) {
-    console.error("[call-complete] decision log append failed:", err.message);
+    recordFailure("call-complete.decision_log", err);   // PHASE 0.4
   }
 
   try {
     const facts = extracted.memory_facts || [];
     const contacts = extracted.new_contacts || [];
     const contactFacts = contacts.map(c =>
-      `Remember that Ates knows ${c.name} who is ${c.role}. Context: ${c.notes}`
+      `Remember that Ates
+      // PHASE 0.4: an unset MEMORY_WRITE_URL used to skip this write with no trace at all.
+      // The call's facts never reached memory and nothing said so. knows ${c.name} who is ${c.role}. Context: ${c.notes}`
     );
     const allFacts = [...facts, ...contactFacts];
 
+    
+    if (allFacts.length && !MEMORY_WRITE_URL) {
+
+      recordFailure("call-complete.memory_write_url_skipped",
+
+        "MEMORY_WRITE_URL is unset - ${allItems.length} item(s) were NOT written and are lost unless replayed",
+
+        { count: allFacts.length });
+
+    }
+
     if (allFacts.length && MEMORY_WRITE_URL) {
+
+      // PHASE 0.4b: recorded, not skipped in silence.
       await post(MEMORY_WRITE_URL, {
         action: "memory_update",
         facts: allFacts,
@@ -948,16 +1027,30 @@ app.post("/vapi/confirm_opentable_booking", async (req, res) => {
       deep_link: deepLink,
     };
     const content_b64 = Buffer.from(JSON.stringify(logEntry, null, 2), "utf8").toString("base64");
-    post(ONEDRIVE_ROUTER, {
-      filename: `booking_${date}_${Date.now()}.json`,
-      content_b64,
-      force_folder: "04 Bookings",
-      overwrite: false,
-    }, {}, 10000).catch(e => console.error("[confirm_opentable] log failed:", e.message));
+    // PHASE 0.2 (H4): await the log and tell the truth about it. This used to be
+    // fire-and-forget with the reply already claiming "I've logged" - when the router was
+    // down Ates was told it was logged and it was not.
+    let logged = false;
+    try {
+      await post(ONEDRIVE_ROUTER, {
+        filename: `booking_${date}_${Date.now()}.json`,
+        content_b64,
+        force_folder: "04 Bookings",
+        overwrite: false,
+      }, {}, 10000);
+      logged = true;
+    } catch (e) {
+      recordFailure("confirm_opentable.log", e, { date, slot_time, restaurant_name });
+    }
 
+    const who = restaurant_name || "the restaurant";
+    // Nothing is booked by this endpoint either way - it produces a deep link. Say that
+    // plainly rather than implying a reservation exists.
     vapiRespond(
       res,
-      `I've logged the booking request for ${restaurant_name || "the restaurant"} on ${date} at ${slot_time} for ${party_size || 2}. To complete it, open this link: ${deepLink}. I'll add a calendar reminder once you confirm.`,
+      logged
+        ? `Noted - ${who} on ${date} at ${slot_time} for ${party_size || 2}. It is not booked yet: open this link to finish it: ${deepLink}. I'll add the calendar reminder once you confirm.`
+        : `I could not save the note for ${who} on ${date} at ${slot_time}, so do not rely on me remembering it. It is not booked either - open this link to do it: ${deepLink}.`,
       toolCallId
     );
 
@@ -1080,7 +1173,7 @@ app.post("/vapi/book_resy", async (req, res) => {
 
     // Store config_id temporarily in memory for follow-up confirm call
     // (in-memory, short-lived — enough for the current Vapi call)
-    app.locals.pendingResyBooking = {
+    callState.put(CallState.keyFrom(req.body), "resy_booking", {   // PHASE 0.1
       config_token: configId,
       venue_name,
       venue_id,
@@ -1088,7 +1181,7 @@ app.post("/vapi/book_resy", async (req, res) => {
       time: slotTime,
       party_size,
       timestamp: Date.now(),
-    };
+    });
 
     console.log(`[book_resy] ${venue_name} ${date} — slot ${slotTime}, config ${configId}`);
 
@@ -1108,11 +1201,14 @@ app.post("/vapi/confirm_resy_booking", async (req, res) => {
   const confirm = args?.confirm !== false; // default true
 
   if (!confirm) {
-    app.locals.pendingResyBooking = null;
+    callState.clear(CallState.keyFrom(req.body), "resy_booking");   // PHASE 0.1
     return vapiRespond(res, "Booking cancelled. Let me know if you want to try a different time.", toolCallId);
   }
 
-  const pending = app.locals.pendingResyBooking;
+  const pending = callState.get(CallState.keyFrom(req.body), "resy_booking");   // PHASE 0.1
+  if (!pending) {
+    return vapiRespond(res, "That booking request expired. Want me to search again?", toolCallId);
+  }
   if (!pending || (Date.now() - pending.timestamp) > 5 * 60 * 1000) {
     return vapiRespond(res, "The booking session expired. Please start over with the restaurant name.", toolCallId);
   }
@@ -1200,7 +1296,7 @@ app.post("/vapi/confirm_resy_booking", async (req, res) => {
         overwrite: false,
       }, {}, 10000).catch(e => console.error("[confirm_resy] log failed:", e.message));
 
-      app.locals.pendingResyBooking = null;
+      callState.clear(CallState.keyFrom(req.body), "resy_booking");   // PHASE 0.1
       vapiRespond(res, confirmationMsg + " I've also added it to your calendar.", toolCallId);
       console.log(`[confirm_resy_booking] SUCCESS — ${pending.venue_name} ${pending.date} ${pending.time} resy_id=${resyId}`);
 
@@ -1690,7 +1786,7 @@ app.get("/health", (_req, res) => res.json({
   uptime: process.uptime(),
   time: nowET(),
   v: "1.7",
-  meeting_active: meetingState.active,
+  state: callState.stats(),   // PHASE 0.1: per-call, not one global boolean
   tools: [
     "get_today_schedule", "get_urgent_emails", "get_open_loops", "get_brain_fact",
     "get_weather", "book_opentable", "confirm_opentable_booking",
@@ -1700,5 +1796,15 @@ app.get("/health", (_req, res) => res.json({
   ],
 }));
 app.get("/", (_req, res) => res.json({ ok: true, server: "cammy-vapi-tool-server", v: "1.7" }));
+
+
+// PHASE 0.4: a missing MEMORY_WRITE_URL silently disabled the memory write for every call.
+// Configuration holes must announce themselves, not present as working software.
+for (const [k, why] of [
+  ["MEMORY_WRITE_URL", "call transcripts, tasks and facts will NOT reach memory"],
+  ["ONEDRIVE_ROUTER", "call logs and booking notes will NOT be saved"],
+]) {
+  if (!process.env[k]) console.error(`[CONFIG MISSING] ${k} is unset - ${why}`);
+}
 
 app.listen(PORT, () => console.log(`[${nowET()}] Cammy Vapi Tool Server v1.7 on port ${PORT}`));
