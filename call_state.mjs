@@ -134,14 +134,27 @@ export class CallState {
 }
 
 /*
-  ── Wiring, three edits ─────────────────────────────────────────────────────
+  ── Wiring (done — this is a record, not a TODO) ────────────────────────────
+
+  TRACKER_42_V1 (2026-08-23): this block used to read as forward-looking
+  patch instructions ("replace `meetingState = {...}` with...", "in the
+  confirm handlers..."). All four edits it described landed in server.js
+  under "Phase 0.1: per-call state — kill two live data-loss races" (#2,
+  commit d0a0339) and are still in place — grep server.js for "PHASE 0.1" to
+  see all of them: the callState import/instantiation near the top, the
+  meeting start/end put/get/clear, the resy_booking put/get/clear, and the
+  /health `state: callState.stats()` line. It also pointed at
+  `code/tests/call_state.test.mjs`, a path that never existed in this repo's
+  history — the test lives at the repo root, `call_state.test.mjs`.
+  Left here as a historical note of what shipped and why, not as something
+  still to be done.
 
   1) Near the top of server.js:
 
        import { CallState, SlotConflictError } from "./call_state.mjs";
        const callState = new CallState();
 
-  2) /meeting/start — replace `meetingState = {...}` with:
+  2) /meeting/start:
 
        const callKey = CallState.keyFrom(req.body);
        try {
@@ -169,7 +182,7 @@ export class CallState {
        // ...build the summary...
        callState.clear(callKey, "meeting");
 
-  3) Bookings and rides — replace the app.locals singletons:
+  3) Bookings and rides — replaced the app.locals singletons:
 
        // in book_resy / order_uber
        callState.put(CallState.keyFrom(req.body), "resy_booking", {...});
@@ -183,7 +196,7 @@ export class CallState {
        // ...on success...
        callState.clear(CallState.keyFrom(req.body), "resy_booking");
 
-  4) /health — replace the bare `meeting_active` boolean:
+  4) /health — replaced the bare `meeting_active` boolean:
 
        app.get("/health", (_req, res) => res.json({
          ok: true, uptime: process.uptime(), time: nowET(), v: V_SHORT,
@@ -193,12 +206,9 @@ export class CallState {
 
   ── Verify ──────────────────────────────────────────────────────────────────
     node --check server.js
-    node code/tests/call_state.test.mjs
-
-  Then re-run the audit harness — the two race checks in run-perf.sh should now
-  report isolation instead of last-writer-wins.
+    node call_state.test.mjs
 
   ── Rollback ────────────────────────────────────────────────────────────────
-    git revert the wiring commit. This file is additive; deleting it and the four
-    edits restores the previous behavior exactly.
+    git revert the wiring commit (d0a0339). This file is additive; deleting it
+    and the four edits above restores the previous behavior exactly.
 */
