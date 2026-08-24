@@ -1661,11 +1661,41 @@ function instagramShortcode(input) {
 
 // ── Helper: canonicalize to a post URL Instagram/oEmbed accepts ──
 function normalizeInstagramUrl(input) {
-  // A full instagram.com link passes through unchanged (keeps /p/ vs /reel/).
-  if (/^https?:\/\/[^ ]*instagram\.com\//i.test(String(input))) return String(input).trim();
-  // A bare shortcode gets turned into a canonical reel URL.
-  const code = instagramShortcode(input);
-  if (code) return `https://www.instagram.com/reel/${code}/`;
+  // INSTAGRAM_HOSTNAME_ALLOWLIST_V1 (2026-08-24) — audit finding, P2.
+  //
+  // The previous test was a REGEX over the whole string:
+  //     /^https?:\/\/[^ ]*instagram\.com\//i
+  // `[^ ]*` swallows anything without a space, so all three of these passed:
+  //     https://evilinstagram.com/p/x/      lookalike registrable domain
+  //     https://evil.com/instagram.com/p/x  instagram.com merely in the PATH
+  //     http://instagram.com/p/x/           plaintext, downgradeable
+  // Whatever came back was handed to resolveInstagramMedia, so an attacker-chosen host
+  // decided what Cammy fetched and then read out on a call.
+  //
+  // Parse the URL and check the HOSTNAME as a hostname. Same class of bug as the
+  // substring matching that routed "agenda" to the lawyer — a structured value
+  // compared as a flat string.
+  const raw = String(input == null ? "" : input).trim();
+  if (!raw) return null;
+
+  let url;
+  try {
+    url = new URL(raw);
+  } catch {
+    // Not a URL at all: it may still be a bare shortcode.
+    const bare = instagramShortcode(raw);
+    return bare ? `https://www.instagram.com/reel/${bare}/` : null;
+  }
+
+  const hostname = url.hostname.toLowerCase();
+  const allowed =
+    url.protocol === "https:" &&
+    (hostname === "instagram.com" || hostname.endsWith(".instagram.com"));
+  if (allowed) return url.toString();
+
+  // A rejected URL does NOT fall through to the bare-shortcode reader: it would lift a
+  // code out of the attacker's URL and rebuild a valid-looking Instagram link from it,
+  // quietly defeating the check above.
   return null;
 }
 
