@@ -67,8 +67,9 @@ const PORT = process.env.PORT || 3000;
 // ── Env vars ─────────────────────────────────────────────────
 const PIPEDREAM_GCAL_URL  = process.env.PIPEDREAM_GCAL_URL;
 const ONEDRIVE_ROUTER     = process.env.ONEDRIVE_ROUTER  || "https://eoc09ly9stpskyz.m.pipedream.net";
-const READ_ENDPOINT       = process.env.READ_ENDPOINT    || "https://eo54pqk9broiael.m.pipedream.net";
-const BRAIN_ITEM_ID       = process.env.BRAIN_ITEM_ID    || "FD682E54F97FD13C!sfe87fab543a74c35a325354af330643e";
+// READ_ENDPOINT / BRAIN_ITEM_ID removed 2026-08-24: the Pipedream brain
+// fetch they served is gone. ONEDRIVE_ROUTER above is a different thing
+// (file routing) and stays.
 const ONEDRIVE_MOVE_URL   = process.env.ONEDRIVE_MOVE_URL || "";
 const OPENAI_API_KEY      = process.env.OPENAI_API_KEY || "";
 const MEMORY_WRITE_URL    = process.env.MEMORY_WRITE_URL || "";
@@ -186,16 +187,30 @@ let brainCache = null;
 let brainCacheAt = 0;
 
 async function readBrain() {
-  if (brainCache && Date.now() - brainCacheAt < 5 * 60 * 1000) return brainCache;
-  const resp = await get(`${READ_ENDPOINT}?item_id=${encodeURIComponent(BRAIN_ITEM_ID)}`);
-  if (resp.body?.download_url) {
-    const dl = await get(resp.body.download_url);
-    brainCache = typeof dl.body === "string" ? JSON.parse(dl.body) : dl.body;
-    brainCacheAt = Date.now();
-    return brainCache;
-  }
-  throw new Error("Could not read brain.json from read endpoint");
+  // ONE_BRAIN_V1 (2026-08-24): local file, generated from Cammy's one brain by
+  // ops/generate_brain_json.py. No Pipedream, no OneDrive, no network hop.
+  //
+  // What this replaced was broken three ways at once:
+  //   1. The Pipedream READ_ENDPOINT returned HTTP 400 "Missing query or
+  //      category" — it never accepted item_id, so this function THREW on every
+  //      call and the phone said "I had trouble accessing your knowledge base."
+  //   2. Zero key overlap: the file had tier1_contacts/principal/voice_rules,
+  //      this server reads contacts/preferences/open_loops. Even a successful
+  //      fetch could not have matched anything.
+  //   3. The file was 63 days stale with no writer.
+  //
+  // Voice has a hard turn-taking budget, so a network round trip before Cammy
+  // speaks is the most expensive thing on this path. A local read is ~0ms.
+  if (brainCache) return brainCache;
+  const { readFileSync } = await import("node:fs");
+  const { fileURLToPath } = await import("node:url");
+  const { dirname, join } = await import("node:path");
+  const here = dirname(fileURLToPath(import.meta.url));
+  brainCache = JSON.parse(readFileSync(join(here, "brain.json"), "utf8"));
+  brainCacheAt = Date.now();
+  return brainCache;
 }
+
 
 // ── Helper: extract Vapi tool call args ──────────────────────
 function extractArgs(body) {
