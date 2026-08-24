@@ -49,6 +49,36 @@ ok("B confirms Carbone",                    cs.get(B, "resy_booking").venue_name
 cs.clear(A, "resy_booking");
 ok("B's pending booking survives A confirming", cs.get(B, "resy_booking")?.venue_name === "Carbone");
 
+// ── SAME-CALL UBER ESTIMATE OVERWRITE ────────────────────────────────────────
+// Re-estimating in one Vapi call must replace the pending ride, while another
+// call's estimate remains isolated.
+cs.put(A, "uber_ride", {
+  product_id: "uberx",
+  fare_id: "fare-airport",
+  destination_name: "Airport",
+});
+cs.put(A, "uber_ride", {
+  product_id: "uberxl",
+  fare_id: "fare-downtown",
+  destination_name: "Downtown",
+}, { force: true });
+cs.put(B, "uber_ride", {
+  product_id: "uberblack",
+  fare_id: "fare-suburb",
+  destination_name: "Suburbs",
+});
+
+const aUber = cs.get(A, "uber_ride");
+const bUber = cs.get(B, "uber_ride");
+ok("second same-call Uber estimate replaces the first",
+   aUber?.product_id === "uberxl" &&
+   aUber?.fare_id === "fare-downtown" &&
+   aUber?.destination_name === "Downtown");
+ok("a same-call Uber overwrite does not affect another call",
+   bUber?.product_id === "uberblack" &&
+   bUber?.fare_id === "fare-suburb" &&
+   bUber?.destination_name === "Suburbs");
+
 // ── slot isolation within one call ───────────────────────────────────────────
 ok("a meeting and a booking coexist on one call",
    !!cs.get(B, "meeting") && !!cs.get(B, "resy_booking"));
