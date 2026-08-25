@@ -1421,7 +1421,7 @@ app.post("/vapi/order_uber", async (req, res) => {
 
     // Step 3: Confirm with Ates before requesting
     // Store pending ride for confirm_uber call
-    app.locals.pendingUberRide = {
+    callState.put(CallState.keyFrom(req.body), "uber_ride", {   // PHASE 0.1
       product_id: product.product_id,
       product_name: product.display_name,
       fare_id: fareId,
@@ -1432,7 +1432,19 @@ app.post("/vapi/order_uber", async (req, res) => {
       destination_name: destination,
       fare_display: fareDisplay,
       timestamp: Date.now(),
-    };
+      // UBER_REQUOTE_FORCE_V1: a re-estimate must REPLACE the pending ride.
+      // CallState.put throws SlotConflictError on an unexpired slot unless forced,
+      // and order_uber's outer catch turns that into "I had trouble booking an
+      // Uber. Try the Uber app directly." So without this flag, "airport" followed
+      // by "actually, downtown" fails for the full 3-minute TTL -- a regression
+      // against the global this replaces, which simply overwrote.
+      //
+      // Refusing is right for `meeting` (it handles SlotConflictError at :466 and
+      // can say "close the running one first?"). It is wrong here: nothing has been
+      // ordered yet, so there is nothing to protect -- only a stale quote to drop.
+      // call_state.test.mjs asserts exactly this: "second same-call Uber estimate
+      // replaces the first".
+    }, { force: true });
 
     vapiRespond(
       res,
@@ -1457,12 +1469,12 @@ app.post("/vapi/confirm_uber_ride", async (req, res) => {
   const confirm = args?.confirm !== false;
 
   if (!confirm) {
-    app.locals.pendingUberRide = null;
+    callState.clear(CallState.keyFrom(req.body), "uber_ride");   // PHASE 0.1
     return vapiRespond(res, "Ride cancelled.", toolCallId);
   }
 
-  const pending = app.locals.pendingUberRide;
-  if (!pending || (Date.now() - pending.timestamp) > 3 * 60 * 1000) {
+  const pending = callState.get(CallState.keyFrom(req.body), "uber_ride");   // PHASE 0.1
+  if (!pending) {
     return vapiRespond(res, "The ride estimate expired. Please start over with your destination.", toolCallId);
   }
 
@@ -1495,7 +1507,7 @@ app.post("/vapi/confirm_uber_ride", async (req, res) => {
 
     if (rideResp.status === 202 || rideResp.body?.request_id) {
       const requestId = rideResp.body?.request_id || "confirmed";
-      app.locals.pendingUberRide = null;
+      callState.clear(CallState.keyFrom(req.body), "uber_ride");   // PHASE 0.1
       vapiRespond(res, `Your ${pending.product_name} is on the way to take you to ${pending.destination_name}. Request ID: ${requestId}. You can track it in the Uber app.`, toolCallId);
       console.log(`[confirm_uber_ride] SUCCESS request_id=${requestId}`);
     } else {
