@@ -1,1 +1,6 @@
 node_modules/
+
+# Playwright MCP browser artifacts — page snapshots capture whatever is on
+# screen, including form fields. They land in whatever the working directory
+# happens to be, so any repo can catch them by accident.
+.playwright-mcp/
