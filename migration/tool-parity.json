@@ -1,0 +1,237 @@
+{
+  "schema": 1,
+  "source_snapshot_date": "2026-09-07",
+  "render_source_revision": "e3fbb41bb2fb1bf8a0e9cad8870d0ce57dbc7f6d",
+  "pipedream_source_complete": false,
+  "current_assistant_config_verified": false,
+  "render_endpoints": [
+    {
+      "path": "/vapi/get_today_schedule",
+      "parity": "unverified"
+    },
+    {
+      "path": "/vapi/get_urgent_emails",
+      "parity": "unverified"
+    },
+    {
+      "path": "/vapi/get_open_loops",
+      "parity": "unverified"
+    },
+    {
+      "path": "/vapi/get_brain_fact",
+      "parity": "unverified"
+    },
+    {
+      "path": "/onedrive/move",
+      "parity": "unverified"
+    },
+    {
+      "path": "/meeting/start",
+      "parity": "unverified"
+    },
+    {
+      "path": "/meeting/end",
+      "parity": "unverified"
+    },
+    {
+      "path": "/call-complete",
+      "parity": "unverified"
+    },
+    {
+      "path": "/vapi/get_weather",
+      "parity": "unverified"
+    },
+    {
+      "path": "/vapi/book_opentable",
+      "parity": "unverified"
+    },
+    {
+      "path": "/vapi/confirm_opentable_booking",
+      "parity": "unverified"
+    },
+    {
+      "path": "/vapi/book_resy",
+      "parity": "unverified"
+    },
+    {
+      "path": "/vapi/confirm_resy_booking",
+      "parity": "unverified"
+    },
+    {
+      "path": "/vapi/order_uber",
+      "parity": "unverified"
+    },
+    {
+      "path": "/vapi/confirm_uber_ride",
+      "parity": "unverified"
+    },
+    {
+      "path": "/vapi/make_call",
+      "parity": "unverified"
+    },
+    {
+      "path": "/vapi/ask_computer",
+      "parity": "unverified"
+    },
+    {
+      "path": "/vapi/view_instagram_video",
+      "parity": "unverified"
+    }
+  ],
+  "historical_tools": [
+    {
+      "name": "get_brain_fact",
+      "historical_host": "other",
+      "parity": "unverified"
+    },
+    {
+      "name": "get_open_loops",
+      "historical_host": "other",
+      "parity": "unverified"
+    },
+    {
+      "name": "get_today_schedule",
+      "historical_host": "other",
+      "parity": "unverified"
+    },
+    {
+      "name": "get_calendar_events",
+      "historical_host": "other",
+      "parity": "unverified"
+    },
+    {
+      "name": "create_calendar_event",
+      "historical_host": "pipedream",
+      "parity": "unverified"
+    },
+    {
+      "name": "get_urgent_emails",
+      "historical_host": "pipedream",
+      "parity": "unverified"
+    },
+    {
+      "name": "send_email",
+      "historical_host": "other",
+      "parity": "unverified"
+    },
+    {
+      "name": "web_search",
+      "historical_host": "pipedream",
+      "parity": "unverified"
+    },
+    {
+      "name": "news_brief",
+      "historical_host": "pipedream",
+      "parity": "unverified"
+    },
+    {
+      "name": "restaurant_lookup",
+      "historical_host": "pipedream",
+      "parity": "unverified"
+    },
+    {
+      "name": "search_linkedin",
+      "historical_host": "pipedream",
+      "parity": "unverified"
+    },
+    {
+      "name": "log_capability_request",
+      "historical_host": "pipedream",
+      "parity": "unverified"
+    },
+    {
+      "name": "enqueue_task",
+      "historical_host": "pipedream",
+      "parity": "unverified"
+    },
+    {
+      "name": "log_decision",
+      "historical_host": "pipedream",
+      "parity": "unverified"
+    },
+    {
+      "name": "silent_mode",
+      "historical_host": "pipedream",
+      "parity": "unverified"
+    },
+    {
+      "name": "end_call",
+      "historical_host": "pipedream",
+      "parity": "unverified"
+    },
+    {
+      "name": "push_notify",
+      "historical_host": "pipedream",
+      "parity": "unverified"
+    },
+    {
+      "name": "start_meeting_listen",
+      "historical_host": "render",
+      "parity": "unverified"
+    },
+    {
+      "name": "end_meeting_listen",
+      "historical_host": "render",
+      "parity": "unverified"
+    },
+    {
+      "name": "get_weather",
+      "historical_host": "render",
+      "parity": "unverified"
+    },
+    {
+      "name": "book_opentable",
+      "historical_host": "render",
+      "parity": "unverified"
+    },
+    {
+      "name": "confirm_opentable_booking",
+      "historical_host": "render",
+      "parity": "unverified"
+    },
+    {
+      "name": "book_resy",
+      "historical_host": "render",
+      "parity": "unverified"
+    },
+    {
+      "name": "confirm_resy_booking",
+      "historical_host": "render",
+      "parity": "unverified"
+    },
+    {
+      "name": "order_uber",
+      "historical_host": "render",
+      "parity": "unverified"
+    },
+    {
+      "name": "confirm_uber_ride",
+      "historical_host": "render",
+      "parity": "unverified"
+    },
+    {
+      "name": "make_call",
+      "historical_host": "render",
+      "parity": "unverified"
+    },
+    {
+      "name": "ask_computer",
+      "historical_host": "render",
+      "parity": "unverified"
+    },
+    {
+      "name": "send_sms",
+      "historical_host": "other",
+      "parity": "unverified"
+    },
+    {
+      "name": "lookup_contact_phone",
+      "historical_host": "other",
+      "parity": "unverified"
+    }
+  ],
+  "notes": [
+    "Known Pipedream files are a OneDrive uploader and calendar/email proxy, not the full assistant workflow source.",
+    "Candidate adapters do not establish provider parity or authorize cutover."
+  ]
+}
