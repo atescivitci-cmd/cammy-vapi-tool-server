@@ -3,7 +3,7 @@
   "source_snapshot_date": "2026-09-07",
   "render_source_revision": "e3fbb41bb2fb1bf8a0e9cad8870d0ce57dbc7f6d",
   "pipedream_source_complete": false,
-  "current_assistant_config_verified": false,
+  "current_assistant_config_verified": true,
   "render_endpoints": [
     {
       "path": "/vapi/get_today_schedule",
@@ -232,6 +232,252 @@
   ],
   "notes": [
     "Known Pipedream files are a OneDrive uploader and calendar/email proxy, not the full assistant workflow source.",
-    "Candidate adapters do not establish provider parity or authorize cutover."
-  ]
+    "Candidate adapters do not establish provider parity or authorize cutover.",
+    "Local orchestrator equivalents are reused through the phone bridge; no Render booking implementation is being re-ported. 31 current tools mapped with explicit partials/gaps; runtime parity remains unproven."
+  ],
+  "current_tool_parity": {
+    "schema": 2,
+    "source": "Published assistant read 2026-11-13; all 31 references resolved",
+    "parity_proven": false,
+    "tools": [
+      {
+        "name": "get_brain_fact",
+        "local_equivalent": "query_brain",
+        "status": "mapped",
+        "detail": "Existing local implementation reused.",
+        "evidence": "source mapping and synthetic tests; execution unverified"
+      },
+      {
+        "name": "get_open_loops",
+        "local_equivalent": "review_commitments",
+        "status": "mapped",
+        "detail": "Existing local implementation reused.",
+        "evidence": "source mapping and synthetic tests; execution unverified"
+      },
+      {
+        "name": "get_today_schedule",
+        "local_equivalent": "calendar_today",
+        "status": "mapped",
+        "detail": "Existing local implementation reused.",
+        "evidence": "source mapping and synthetic tests; execution unverified"
+      },
+      {
+        "name": "get_calendar_events",
+        "local_equivalent": "calendar_today",
+        "status": "partial",
+        "detail": "calendar_today provides near-term schedule, not arbitrary range.",
+        "evidence": "source mapping and synthetic tests; execution unverified"
+      },
+      {
+        "name": "create_calendar_event",
+        "local_equivalent": "create_calendar_event",
+        "status": "mapped",
+        "detail": "Existing local implementation reused.",
+        "evidence": "source mapping and synthetic tests; execution unverified"
+      },
+      {
+        "name": "get_urgent_emails",
+        "local_equivalent": "read_email_inbox",
+        "status": "mapped",
+        "detail": "Existing local implementation reused.",
+        "evidence": "source mapping and synthetic tests; execution unverified"
+      },
+      {
+        "name": "send_email",
+        "local_equivalent": "send_email",
+        "status": "mapped",
+        "detail": "Existing local implementation reused.",
+        "evidence": "source mapping and synthetic tests; execution unverified"
+      },
+      {
+        "name": "web_search",
+        "local_equivalent": "existing _searxng_local helper at :8090, governed as web_search",
+        "status": "mapped",
+        "detail": "Existing local implementation reused.",
+        "evidence": "source mapping and synthetic tests; execution unverified"
+      },
+      {
+        "name": "news_brief",
+        "local_equivalent": "existing _searxng_local helper at :8090, governed as web_search",
+        "status": "partial",
+        "detail": "Generic local search, not news formatter.",
+        "evidence": "source mapping and synthetic tests; execution unverified"
+      },
+      {
+        "name": "restaurant_lookup",
+        "local_equivalent": "existing _searxng_local helper at :8090, governed as web_search",
+        "status": "partial",
+        "detail": "Generic local search; specialized shape unverified.",
+        "evidence": "source mapping and synthetic tests; execution unverified"
+      },
+      {
+        "name": "search_linkedin",
+        "local_equivalent": "existing _searxng_local helper at :8090, governed as web_search",
+        "status": "partial",
+        "detail": "Public search, not authenticated LinkedIn.",
+        "evidence": "source mapping and synthetic tests; execution unverified"
+      },
+      {
+        "name": "log_capability_request",
+        "local_equivalent": null,
+        "status": "gap",
+        "detail": "No exact recorder; do not silently create a calendar commitment.",
+        "evidence": "source mapping and synthetic tests; execution unverified"
+      },
+      {
+        "name": "enqueue_task",
+        "local_equivalent": "log_commitment",
+        "status": "partial",
+        "detail": "log_commitment creates a calendar event; differs from generic task spool.",
+        "evidence": "source mapping and synthetic tests; execution unverified"
+      },
+      {
+        "name": "log_decision",
+        "local_equivalent": "record_decision",
+        "status": "mapped",
+        "detail": "Existing local implementation reused.",
+        "evidence": "source mapping and synthetic tests; execution unverified"
+      },
+      {
+        "name": "silent_mode",
+        "local_equivalent": null,
+        "status": "gap",
+        "detail": "No per-call mute control wired.",
+        "evidence": "source mapping and synthetic tests; execution unverified"
+      },
+      {
+        "name": "end_call",
+        "local_equivalent": null,
+        "status": "gap",
+        "detail": "No per-call end control wired.",
+        "evidence": "source mapping and synthetic tests; execution unverified"
+      },
+      {
+        "name": "push_notify",
+        "local_equivalent": null,
+        "status": "gap",
+        "detail": "No push transport verified; do not silently substitute SMS.",
+        "evidence": "source mapping and synthetic tests; execution unverified"
+      },
+      {
+        "name": "start_meeting_listen",
+        "local_equivalent": null,
+        "status": "gap",
+        "detail": "No matching lifecycle dispatcher tool.",
+        "evidence": "source mapping and synthetic tests; execution unverified"
+      },
+      {
+        "name": "end_meeting_listen",
+        "local_equivalent": null,
+        "status": "gap",
+        "detail": "No matching lifecycle dispatcher tool.",
+        "evidence": "source mapping and synthetic tests; execution unverified"
+      },
+      {
+        "name": "get_weather",
+        "local_equivalent": "WeatherAdapter",
+        "status": "mapped",
+        "detail": "Existing local implementation reused.",
+        "evidence": "source mapping and synthetic tests; execution unverified"
+      },
+      {
+        "name": "book_opentable",
+        "local_equivalent": "book_reservation",
+        "status": "mapped",
+        "detail": "Existing local implementation reused.",
+        "evidence": "installed dry-run passed"
+      },
+      {
+        "name": "confirm_opentable_booking",
+        "local_equivalent": "book_reservation",
+        "status": "partial",
+        "detail": "Existing browser task stops before final submission; no confirmed booking proof.",
+        "evidence": "source mapping and synthetic tests; execution unverified"
+      },
+      {
+        "name": "book_resy",
+        "local_equivalent": null,
+        "status": "gap",
+        "detail": "Installed restaurant helper selects OpenTable; Resy site selection missing.",
+        "evidence": "source mapping and synthetic tests; execution unverified"
+      },
+      {
+        "name": "confirm_resy_booking",
+        "local_equivalent": null,
+        "status": "gap",
+        "detail": "Resy site selection missing; never substitute OpenTable.",
+        "evidence": "source mapping and synthetic tests; execution unverified"
+      },
+      {
+        "name": "order_uber",
+        "local_equivalent": "request_ride",
+        "status": "mapped",
+        "detail": "Existing local implementation reused.",
+        "evidence": "installed dry-run passed"
+      },
+      {
+        "name": "confirm_uber_ride",
+        "local_equivalent": "request_ride",
+        "status": "partial",
+        "detail": "Existing browser task stops before request confirmation; no ride receipt.",
+        "evidence": "source mapping and synthetic tests; execution unverified"
+      },
+      {
+        "name": "make_call",
+        "local_equivalent": "TwilioActions.call",
+        "status": "mapped",
+        "detail": "Existing local implementation reused.",
+        "evidence": "source mapping and synthetic tests; execution unverified"
+      },
+      {
+        "name": "ask_computer",
+        "local_equivalent": "deep_research",
+        "status": "mapped",
+        "detail": "Existing local implementation reused.",
+        "evidence": "source mapping and synthetic tests; execution unverified"
+      },
+      {
+        "name": "send_sms",
+        "local_equivalent": "TwilioActions.sms",
+        "status": "mapped",
+        "detail": "Existing local implementation reused.",
+        "evidence": "source mapping and synthetic tests; execution unverified"
+      },
+      {
+        "name": "lookup_contact_phone",
+        "local_equivalent": "lookup_person",
+        "status": "partial",
+        "detail": "Contact profile returned; phone-only extraction unverified.",
+        "evidence": "source mapping and synthetic tests; execution unverified"
+      },
+      {
+        "name": "transfer_call_tool",
+        "local_equivalent": "TransferAdapter / transfer_to_ates",
+        "status": "mapped",
+        "detail": "Existing local implementation reused.",
+        "evidence": "source mapping and synthetic tests; execution unverified"
+      }
+    ],
+    "supplemental": {
+      "commitments": [
+        "log_commitment",
+        "review_commitments",
+        "close_commitment"
+      ],
+      "office": [
+        "build_pptx",
+        "build_xlsx",
+        "build_docx"
+      ],
+      "email_preview": "preview_send_email -> existing send_email confirm=False; installed dry-run passed",
+      "booking_com": "gap: installed hotel helper selects Marriott; no generic browser_task in TOOL_DISPATCH"
+    },
+    "boundaries": [
+      "No agent_tools.py edits",
+      "Authenticated one-time server confirmation before outward actions",
+      "Dry runs only for verification",
+      "No monetary admission",
+      "No /sms /killall or port 7300 changes"
+    ]
+  }
 }
