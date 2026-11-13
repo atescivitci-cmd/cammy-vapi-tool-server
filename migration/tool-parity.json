@@ -233,7 +233,8 @@
   "notes": [
     "Known Pipedream files are a OneDrive uploader and calendar/email proxy, not the full assistant workflow source.",
     "Candidate adapters do not establish provider parity or authorize cutover.",
-    "Local orchestrator equivalents are reused through the phone bridge; no Render booking implementation is being re-ported. 31 current tools mapped with explicit partials/gaps; runtime parity remains unproven."
+    "Local orchestrator equivalents are reused through the phone bridge; no Render booking implementation is being re-ported. 31 current tools mapped with explicit partials/gaps; runtime parity remains unproven.",
+    "One generic Comet-primary/public-Stagehand-fallback adapter supplies site-neutral preview and confirmed single-step routing. Runtime remains dry-run-only. Resy preview gap maps in source; Resy confirmation remains partial. All original 8 gaps and 8 partials have explicit delta entries."
   ],
   "current_tool_parity": {
     "schema": 2,
@@ -382,44 +383,44 @@
       },
       {
         "name": "book_opentable",
-        "local_equivalent": "book_reservation",
+        "local_equivalent": "GenericBrowser: site-configured preview then Comet step",
         "status": "mapped",
-        "detail": "Existing local implementation reused.",
-        "evidence": "installed dry-run passed"
+        "detail": "Generic preview replaces provider-specific preparatory helper. Actual site execution remains unverified.",
+        "evidence": "provider-neutral preview and confirmation tests"
       },
       {
         "name": "confirm_opentable_booking",
-        "local_equivalent": "book_reservation",
+        "local_equivalent": "GenericBrowser: site-bound browser_step",
         "status": "partial",
-        "detail": "Existing browser task stops before final submission; no confirmed booking proof.",
+        "detail": "Structural final-submit path now exists as one confirmed DOM step, replacing stop-before-submit helper. Final provider receipt remains unverified; runtime dry-run-only.",
         "evidence": "source mapping and synthetic tests; execution unverified"
       },
       {
         "name": "book_resy",
-        "local_equivalent": null,
-        "status": "gap",
-        "detail": "Installed restaurant helper selects OpenTable; Resy site selection missing.",
-        "evidence": "source mapping and synthetic tests; execution unverified"
+        "local_equivalent": "GenericBrowser: book_resy -> Comet browser_task preview",
+        "status": "mapped",
+        "detail": "Resy site routing and authenticated-account preview now exist; actual site behavior remains dry-run-only.",
+        "evidence": "generic provider-neutral preview tests"
       },
       {
         "name": "confirm_resy_booking",
-        "local_equivalent": null,
-        "status": "gap",
-        "detail": "Resy site selection missing; never substitute OpenTable.",
-        "evidence": "source mapping and synthetic tests; execution unverified"
+        "local_equivalent": "GenericBrowser: same-session preview + single-use confirmed Comet step",
+        "status": "partial",
+        "detail": "Exact site-bound submit step is implemented; runtime dry-run-only, final reservation receipt unverified.",
+        "evidence": "confirmation, site-binding, replay and backend tests"
       },
       {
         "name": "order_uber",
-        "local_equivalent": "request_ride",
+        "local_equivalent": "GenericBrowser: site-configured preview then Comet step",
         "status": "mapped",
-        "detail": "Existing local implementation reused.",
-        "evidence": "installed dry-run passed"
+        "detail": "Generic preview replaces provider-specific preparatory helper. Actual site execution remains unverified.",
+        "evidence": "provider-neutral preview and confirmation tests"
       },
       {
         "name": "confirm_uber_ride",
-        "local_equivalent": "request_ride",
+        "local_equivalent": "GenericBrowser: site-bound browser_step",
         "status": "partial",
-        "detail": "Existing browser task stops before request confirmation; no ride receipt.",
+        "detail": "Structural final-submit path now exists as one confirmed DOM step, replacing stop-before-submit helper. Final provider receipt remains unverified; runtime dry-run-only.",
         "evidence": "source mapping and synthetic tests; execution unverified"
       },
       {
@@ -470,7 +471,8 @@
         "build_docx"
       ],
       "email_preview": "preview_send_email -> existing send_email confirm=False; installed dry-run passed",
-      "booking_com": "gap: installed hotel helper selects Marriott; no generic browser_task in TOOL_DISPATCH"
+      "booking_com": "GenericBrowser supports Booking.com URL, Comet cookie context and preview/confirmed single-step path; no live booking proof.",
+      "other_sites": "Hilton, DoorDash and arbitrary public HTTPS airline sites use the same adapter. Provider-neutral preview fixtures pass; individual sites not live-qualified."
     },
     "boundaries": [
       "No agent_tools.py edits",
@@ -478,6 +480,111 @@
       "Dry runs only for verification",
       "No monetary admission",
       "No /sms /killall or port 7300 changes"
-    ]
+    ],
+    "generic_browser_delta": [
+      {
+        "tool": "get_calendar_events",
+        "before": "partial",
+        "after": "partial",
+        "generic_adapter_effect": "not closed; generic browser is not a verified semantic replacement"
+      },
+      {
+        "tool": "news_brief",
+        "before": "partial",
+        "after": "partial",
+        "generic_adapter_effect": "not closed; generic browser is not a verified semantic replacement"
+      },
+      {
+        "tool": "restaurant_lookup",
+        "before": "partial",
+        "after": "partial",
+        "generic_adapter_effect": "not closed; generic browser is not a verified semantic replacement"
+      },
+      {
+        "tool": "search_linkedin",
+        "before": "partial",
+        "after": "partial",
+        "generic_adapter_effect": "account-browser path available, but structured LinkedIn equivalence unverified"
+      },
+      {
+        "tool": "log_capability_request",
+        "before": "gap",
+        "after": "gap",
+        "generic_adapter_effect": "not closed; generic browser is not a verified semantic replacement"
+      },
+      {
+        "tool": "enqueue_task",
+        "before": "partial",
+        "after": "partial",
+        "generic_adapter_effect": "not closed; generic browser is not a verified semantic replacement"
+      },
+      {
+        "tool": "silent_mode",
+        "before": "gap",
+        "after": "gap",
+        "generic_adapter_effect": "not closed; generic browser is not a verified semantic replacement"
+      },
+      {
+        "tool": "end_call",
+        "before": "gap",
+        "after": "gap",
+        "generic_adapter_effect": "not closed; generic browser is not a verified semantic replacement"
+      },
+      {
+        "tool": "push_notify",
+        "before": "gap",
+        "after": "gap",
+        "generic_adapter_effect": "not closed; generic browser is not a verified semantic replacement"
+      },
+      {
+        "tool": "start_meeting_listen",
+        "before": "gap",
+        "after": "gap",
+        "generic_adapter_effect": "not closed; generic browser is not a verified semantic replacement"
+      },
+      {
+        "tool": "end_meeting_listen",
+        "before": "gap",
+        "after": "gap",
+        "generic_adapter_effect": "not closed; generic browser is not a verified semantic replacement"
+      },
+      {
+        "tool": "confirm_opentable_booking",
+        "before": "partial",
+        "after": "partial",
+        "generic_adapter_effect": "missing execution path supplied; remains partial pending verified receipt"
+      },
+      {
+        "tool": "book_resy",
+        "before": "gap",
+        "after": "mapped",
+        "generic_adapter_effect": "site-routing gap closed in source; provider behavior unverified"
+      },
+      {
+        "tool": "confirm_resy_booking",
+        "before": "gap",
+        "after": "partial",
+        "generic_adapter_effect": "missing execution path supplied; remains partial pending verified receipt"
+      },
+      {
+        "tool": "confirm_uber_ride",
+        "before": "partial",
+        "after": "partial",
+        "generic_adapter_effect": "missing execution path supplied; remains partial pending verified receipt"
+      },
+      {
+        "tool": "lookup_contact_phone",
+        "before": "partial",
+        "after": "partial",
+        "generic_adapter_effect": "not closed; generic browser is not a verified semantic replacement"
+      }
+    ],
+    "generic_browser": {
+      "primary": "existing Comet CDP, browser_task/use_local_browser=true",
+      "fallback": "Browserbase + @browserbasehq/stagehand 3.7.3; public inspect only, no account data",
+      "mode": "dry_run_only",
+      "login": "needs Ates to log in; no credential entry",
+      "cloud_live_verified": false
+    }
   }
 }
